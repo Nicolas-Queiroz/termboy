@@ -26,7 +26,7 @@ class TestRenderDiferenca(unittest.TestCase):
                     ant = grade
                     cheio = TerminalFalso(80, 24)
                     cheio.escrever(tela.render())
-                    self.assertEqual(term.celulas, cheio.celulas, f"quadro {k}")
+                    self.assertEqual(term.visivel(), cheio.visivel(), f"quadro {k}")
 
     def test_quadro_igual_nao_emite_nada(self):
         grade = tb.quadro("reino", "gba", 5.0, (80, 24)).celulas()
@@ -39,7 +39,39 @@ class TestRenderDiferenca(unittest.TestCase):
         saida.mostrar(tb.quadro("turbo", "gba", 5.0, (80, 24)))
         saida.mostrar(tb.quadro("turbo", "gba", 5.0, (90, 30)))
         self.assertEqual(len(escrito), 2)  # o quadro repetido não escreve nada
-        self.assertTrue(escrito[1].startswith("\x1b[0m\x1b[2J"))
+        self.assertTrue(escrito[1].startswith("\x1b[?2026h\x1b[0m\x1b[2J"))
+
+    def test_espera_o_terminal_confirmar(self):
+        """Com no máximo EM_VOO quadros sem resposta, nada se acumula num terminal lento."""
+        escrito = []
+        saida = tb.Saida(escrito.append, confirmar=True)
+        for k in range(saida.EM_VOO):
+            self.assertTrue(saida.pronta(0.0))
+            saida.mostrar(tb.quadro("turbo", "gba", 4.0 + k, (80, 24)))
+        self.assertTrue(all(e.endswith("\x1b[5n") for e in escrito))
+        self.assertFalse(saida.pronta(saida.t_envio + 0.1))
+        saida.confirmado(1)
+        self.assertTrue(saida.pronta(saida.t_envio + 0.1))
+
+    def test_terminal_que_nao_responde_nao_trava(self):
+        saida = tb.Saida(lambda s: None, confirmar=True)
+        for k in range(20):
+            if saida.pronta(saida.t_envio + 2.0):
+                saida.mostrar(tb.quadro("turbo", "gba", 4.0 + k * 0.3, (80, 24)))
+        self.assertFalse(saida.confirmar)
+
+    def test_menos_bytes_que_antes(self):
+        """Frente e fundo separados e espaço nas células de uma cor só: menos bytes."""
+        tela = tb.quadro("reino", "gba", 13.5, (80, 24))
+        antigo = 0
+        for linha in tela.celulas():
+            ant = None
+            for ch, fg, bg in linha:
+                if (fg, bg) != ant:
+                    antigo += len("\x1b[38;2;%d;%d;%dm\x1b[48;2;%d;%d;%dm" % (fg + bg))
+                    ant = (fg, bg)
+                antigo += len(ch.encode())
+        self.assertLess(len(tela.render().encode()), antigo * 0.75)
 
     def test_texto_alinhado(self):
         tela = tb.Tela("gba", (20, 4))
@@ -57,6 +89,9 @@ class TestTeclas(unittest.TestCase):
         ev = tb.ler_teclas(" q\x1b[A\x1bOD\r\x1b")
         self.assertEqual([e[0] for e in ev], [" ", "q", "↑", "←", "enter", "esc"])
         self.assertTrue(all(not e[2] for e in ev))
+
+    def test_resposta_de_status_nao_vira_tecla(self):
+        self.assertEqual(tb.ler_teclas("\x1b[0n"), [])
 
     def test_kitty(self):
         # espaço apertou, repetiu, soltou; seta para cima soltou; ctrl+c; esc; resposta de consulta

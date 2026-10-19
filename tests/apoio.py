@@ -17,13 +17,14 @@ def carregar_termboy():
     return mod
 
 
-_SEQ = re.compile(r"\x1b\[([0-9;]*)([A-Za-z])")
+_SEQ = re.compile(r"\x1b\[(\??[0-9;]*)([A-Za-z])")
 
 
 class TerminalFalso:
     """Aplica a saída ANSI do render() numa grade de células (caractere, frente, fundo).
 
-    Entende só o que o render emite: limpar (2J), posicionar cursor (H), cores 24 bits e reset (m).
+    Entende só o que o render emite: limpar (2J), posicionar cursor (H), cores 24 bits e
+    reset (m); ignora o início/fim de quadro sincronizado (?2026h/l) e o pedido de status (5n).
     Comparar a grade, e não a string, deixa o teste valer também para o render por
     diferença da Fase 1, que emite menos bytes para o mesmo resultado na tela.
     """
@@ -48,6 +49,8 @@ class TerminalFalso:
             i += 1
 
     def _csi(self, params, cmd):
+        if params in ("?2026", "5"):
+            return
         nums = [int(p) if p else 0 for p in params.split(";")] if params else []
         if cmd == "J" and nums == [2]:
             self.celulas = [[(" ", None, None)] * self.cols for _ in range(self.rows)]
@@ -75,8 +78,9 @@ class TerminalFalso:
         else:
             raise ValueError(f"sequência não suportada: CSI {params}{cmd}")
 
+    def visivel(self):
+        """A grade como o olho vê: um espaço mostra só o fundo, nas duas metades da célula."""
+        return [[("▀", b, b) if ch == " " else (ch, f, b) for ch, f, b in linha] for linha in self.celulas]
+
     def hash(self):
-        h = hashlib.sha256()
-        for linha in self.celulas:
-            h.update(repr(linha).encode())
-        return h.hexdigest()[:16]
+        return hashlib.sha256(repr(self.visivel()).encode()).hexdigest()[:16]

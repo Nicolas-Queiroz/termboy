@@ -365,8 +365,9 @@ class Tela:
 def emitir(grade, anterior=None, folga=3):
     """Converte a grade em ANSI. Com `anterior`, emite só as sequências de células que
     mudaram (buracos de até `folga` células iguais entram na sequência, porque reposicionar
-    o cursor custa mais que reescrevê-las) e só troca a cor quando ela muda."""
-    out, cor = [], None
+    o cursor custa mais que reescrevê-las). Frente e fundo só são reenviados quando mudam,
+    e uma célula de uma cor só vira um espaço, que dispensa a cor de frente."""
+    out, frente, fundo = [], None, None
     for row, linha in enumerate(grade):
         n = len(linha)
         velha = anterior[row] if anterior is not None and row < len(anterior) else None
@@ -390,9 +391,20 @@ def emitir(grade, anterior=None, folga=3):
         for ini, fim in trechos:
             out.append(f"\x1b[{row + 1};{ini + 1}H")
             for ch, fg, bg in linha[ini:fim]:
-                if (fg, bg) != cor:
-                    out.append("\x1b[38;2;%d;%d;%dm\x1b[48;2;%d;%d;%dm" % (fg + bg))
-                    cor = (fg, bg)
+                if ch == "▀" and fg == bg:
+                    ch = " "
+                muda_fundo = bg != fundo
+                muda_frente = ch != " " and fg != frente
+                if muda_fundo and muda_frente:
+                    out.append("\x1b[38;2;%d;%d;%d;48;2;%d;%d;%dm" % (fg + bg))
+                elif muda_fundo:
+                    out.append("\x1b[48;2;%d;%d;%dm" % bg)
+                elif muda_frente:
+                    out.append("\x1b[38;2;%d;%d;%dm" % fg)
+                if muda_fundo:
+                    fundo = bg
+                if muda_frente:
+                    frente = fg
                 out.append(ch)
     if out:
         out.append("\x1b[0m")
@@ -403,14 +415,41 @@ class Saida:
     """Dona do terminal: lembra o último quadro e escreve só a diferença.
 
     Redesenha tudo na primeira vez, quando o tamanho muda ou depois de `forcar()`
-    (chamado pelo handler de SIGWINCH através de uma flag)."""
+    (chamado pelo handler de SIGWINCH através de uma flag).
 
-    def __init__(self, escrever=None):
+    Com `confirmar`, cada quadro termina pedindo um "recebido" ao terminal (DSR, que
+    todo terminal responde depois de processar o que veio antes). Só mandamos outro
+    quadro com no máximo EM_VOO sem resposta: num terminal lento ou remoto os quadros
+    não se acumulam numa fila, e o jogo não fica atrasado em relação às teclas."""
+
+    EM_VOO = 2
+
+    def __init__(self, escrever=None, confirmar=False):
         self.escrever = escrever or _escrever_stdout
         self.anterior = None
+        self.confirmar = confirmar
+        self.pendentes, self.t_envio, self.respondeu, self.silencios = 0, 0.0, False, 0
 
     def forcar(self):
         self.anterior = None
+
+    def confirmado(self, n):
+        if n:
+            self.pendentes = max(0, self.pendentes - n)
+            self.respondeu, self.silencios = True, 0
+
+    def pronta(self, agora):
+        """Pode mandar outro quadro, ou ainda esperamos o terminal?"""
+        if not self.confirmar or self.pendentes < self.EM_VOO:
+            return True
+        if agora - self.t_envio > (1.0 if self.respondeu else 0.25):
+            # terminal que nunca respondeu: desiste de esperar; se já respondeu, só está lento
+            self.silencios += 1
+            if not self.respondeu and self.silencios >= 3:
+                self.confirmar = False
+            self.pendentes = 0
+            return True
+        return False
 
     def mostrar(self, tela):
         grade = tela.celulas()
@@ -421,6 +460,12 @@ class Saida:
             saida = emitir(grade, ant)
         self.anterior = grade
         if saida:
+            # quadro sincronizado: o terminal mostra tudo de uma vez (quem não entende, ignora)
+            saida = "\x1b[?2026h" + saida + "\x1b[?2026l"
+            if self.confirmar:
+                saida += "\x1b[5n"
+                self.pendentes += 1
+                self.t_envio = time.monotonic()
             self.escrever(saida)
 
 
@@ -1847,6 +1892,7 @@ class Entrada:
         self.seg = {}  # tecla -> instante do último byte (fallback) ou None (kitty)
         self.apert, self.solt, self.rep = set(), set(), set()
         self.eventos = []  # eventos crus deste tick: (tecla, tipo)
+        self._confirmacoes = 0  # respostas "\x1b[0n" do terminal (ver Saida)
 
     def __enter__(self):
         if termios and sys.stdin.isatty():
@@ -1894,12 +1940,27 @@ class Entrada:
                 if not bloco:
                     break
                 dados += bloco.decode(errors="ignore")
+            self._confirmacoes += dados.count("\x1b[0n")
             for tecla, tipo, kitty in ler_teclas(dados):
                 self.injetar(tecla, tipo, None if kitty else agora)
         for tecla, quando in list(self.seg.items()):
             if quando is not None and agora - quando > self.ESPERA:
                 del self.seg[tecla]
                 self.solt.add(tecla)
+
+    def confirmacoes(self):
+        """Quantas respostas de quadro chegaram desde a última consulta."""
+        n, self._confirmacoes = self._confirmacoes, 0
+        return n
+
+    def esperar(self, segundos):
+        """Dorme até `segundos`, mas acorda assim que chega uma tecla ou resposta."""
+        if segundos <= 0:
+            return
+        if self.fd is not None:
+            select.select([self.fd], [], [], segundos)
+        else:
+            time.sleep(segundos)
 
     def injetar(self, tecla, tipo=1, quando=None):
         """Registra um evento. quando=None: evento com tipo exato (kitty, replay, teste)."""
@@ -2111,8 +2172,12 @@ class Laco:
             if self.redimensionou:
                 self.redimensionou = False
                 self.saida.forcar()
-            self.saida.mostrar(desenhar())
-            time.sleep(max(0.0, 1 / self.fps - (time.monotonic() - agora)))
+            self.saida.confirmado(self.entrada.confirmacoes())
+            if self.saida.pronta(agora):
+                self.saida.mostrar(desenhar())
+                self.entrada.esperar(1 / self.fps - (time.monotonic() - agora))
+            else:
+                self.entrada.esperar(PASSO / 4)  # o terminal ainda não engoliu os quadros anteriores
 
 
 # ======================================================================== jogos: base
@@ -2946,7 +3011,8 @@ class TochaEterna(Jogo):
         cam = CamGrade(T, hx + 0.5, hy + 0.5, tela.W, tela.H)
         tela.retangulo(0, 0, tela.W, tela.H, (3, 2, 8))
         raio = self.raio()
-        tremor = 0.92 + 0.08 * math.sin(self.t * 11) * math.sin(self.t * 7.3)
+        tq = int(self.t * 8) / 8  # a luz tremula 8 vezes por segundo: menos células mudam por quadro
+        tremor = 0.92 + 0.08 * math.sin(tq * 11) * math.sin(tq * 7.3)
         cols = tela.W // T + 3
         rows = tela.H // T + 3
         x0, y0 = int(cam.cx - cols / 2), int(cam.cy - rows / 2)
@@ -3517,8 +3583,12 @@ def tocar(nome, estado, entrada, saida):
         entrada.fim_do_tick()
         if estado.pop("redimensionou", False):
             saida.forcar()
+        saida.confirmado(entrada.confirmacoes())
+        if not saida.pronta(inicio):
+            entrada.esperar(0.01)
+            continue
         saida.mostrar(quadro(nome, estado["estilo"], t))
-        time.sleep(max(0.0, 1 / FPS - (time.monotonic() - inicio)))
+        entrada.esperar(1 / FPS - (time.monotonic() - inicio))
 
 
 def proximo_estilo(estilo):
@@ -3551,6 +3621,7 @@ class Terminal:
             signal.signal(signal.SIGWINCH, self._sigwinch)
         _escrever_stdout("\x1b[?1049h\x1b[?25l\x1b[2J")
         self.entrada.__enter__()
+        self.saida.confirmar = self.entrada.fd is not None
         return self
 
     def __exit__(self, *_):
@@ -3610,11 +3681,13 @@ def assistir(caminho, estilo):
                 term.entrada.fim_do_tick()
                 if estado.pop("redimensionou", False):
                     term.saida.forcar()
-                tela = Tela(estado["estilo"])
-                jogo.desenhar(tela)
-                tela.texto(0, "REPLAY", (255, 90, 90), coluna=1)
-                term.saida.mostrar(tela)
-                time.sleep(max(0.0, PASSO - (time.monotonic() - inicio)))
+                term.saida.confirmado(term.entrada.confirmacoes())
+                if term.saida.pronta(inicio):
+                    tela = Tela(estado["estilo"])
+                    jogo.desenhar(tela)
+                    tela.texto(0, "REPLAY", (255, 90, 90), coluna=1)
+                    term.saida.mostrar(tela)
+                term.entrada.esperar(PASSO - (time.monotonic() - inicio))
     except KeyboardInterrupt:
         pass
 
