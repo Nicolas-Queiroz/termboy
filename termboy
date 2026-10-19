@@ -1,0 +1,1338 @@
+#!/usr/bin/env python3
+"""termboy: aberturas animadas de jogos retrô no terminal, no estilo Game Boy / GBA.
+
+Todas as aberturas, personagens, nomes e cenários são originais.
+
+  termboy                  toca as aberturas em sequência aleatória, em loop
+  termboy turbo            toca só uma abertura, em loop
+  termboy -e gb            escolhe o estilo de cor (gb, gbc, gba, aleatorio)
+  termboy -u               toca uma vez e sai
+  termboy -l               lista as aberturas e estilos
+
+Teclas: q sai | espaço ou → pula para a próxima | e troca o estilo
+"""
+import functools
+import math
+import os
+import random
+import select
+import shutil
+import signal
+import sys
+import time
+
+try:
+    import termios
+    import tty
+except ImportError:  # Windows sem WSL
+    termios = tty = None
+
+FPS = 15
+ESTILOS = {"gb": "Game Boy", "gbc": "Game Boy Color", "gba": "Game Boy Advance"}
+
+GB = [(15, 56, 15), (48, 98, 48), (139, 172, 15), (155, 188, 15)]
+BAYER = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]]
+
+
+# ======================================================================== cores
+def conv(c, estilo):
+    r, g, b = c
+    if estilo == "gb":
+        lum = 0.299 * r + 0.587 * g + 0.114 * b
+        return GB[min(3, int(lum / 64))]
+    if estilo == "gbc":
+        q = lambda v: min(255, round(v / 85) * 85)
+        return (q(r), q(g), q(b))
+    q = lambda v: min(255, (int(v) >> 3) << 3)  # GBA: 15 bits de cor
+    return (q(r), q(g), q(b))
+
+
+def lerp(a, b, p):
+    return a + (b - a) * p
+
+
+def lerp_cor(c1, c2, p):
+    p = max(0.0, min(1.0, p))
+    return tuple(int(lerp(x, y, p)) for x, y in zip(c1, c2))
+
+
+def clarear(c, f):
+    return lerp_cor(c, (255, 255, 255), f)
+
+
+def escurecer(c, f):
+    return lerp_cor(c, (0, 0, 0), f)
+
+
+def ease(p):
+    p = max(0.0, min(1.0, p))
+    return 1 - (1 - p) ** 3
+
+
+def cor_em(stops, p):
+    p = max(0.0, min(1.0, p))
+    for (p0, c0), (p1, c1) in zip(stops, stops[1:]):
+        if p <= p1:
+            return lerp_cor(c0, c1, (p - p0) / max(1e-9, p1 - p0))
+    return stops[-1][1]
+
+
+def _hash(i, j):
+    n = (i * 374761393 + j * 668265263) & 0xFFFFFFFF
+    n = ((n ^ (n >> 13)) * 1274126177) & 0xFFFFFFFF
+    return ((n ^ (n >> 16)) & 0xFFFF) / 65535
+
+
+def ruido(x, y):
+    xi, yi = math.floor(x), math.floor(y)
+    fx, fy = x - xi, y - yi
+    u, v = fx * fx * (3 - 2 * fx), fy * fy * (3 - 2 * fy)
+    a, b = _hash(xi, yi), _hash(xi + 1, yi)
+    c, d = _hash(xi, yi + 1), _hash(xi + 1, yi + 1)
+    return lerp(lerp(a, b, u), lerp(c, d, u), v)
+
+
+def fbm(x, y, oitavas=3):
+    total, amp, norm = 0.0, 1.0, 0.0
+    for _ in range(oitavas):
+        total += ruido(x, y) * amp
+        norm += amp
+        x, y, amp = x * 2.03, y * 2.03, amp * 0.5
+    return total / norm
+
+
+# ======================================================================== sprites
+_n = math.sqrt(0.55 ** 2 + 0.65 ** 2 + 0.52 ** 2)
+LUZ = (-0.55 / _n, -0.65 / _n, 0.52 / _n)
+
+
+def _dentro(pts, px, py):
+    dentro = False
+    j = len(pts) - 1
+    for i in range(len(pts)):
+        xi, yi = pts[i]
+        xj, yj = pts[j]
+        if (yi > py) != (yj > py) and px < (xj - xi) * (py - yi) / (yj - yi + 1e-9) + xi:
+            dentro = not dentro
+        j = i
+    return dentro
+
+
+class Spr:
+    """Sprite montado com formas sombreadas (luz vindo de cima à esquerda)."""
+
+    def __init__(self, w, h):
+        self.w, self.h, self.px = w, h, {}
+
+    def elipse(self, cx, cy, rx, ry, rampa=None, cor=None):
+        rx, ry = max(rx, 0.6), max(ry, 0.6)
+        feitos = []
+        for y in range(int(cy - ry) - 1, int(cy + ry) + 2):
+            for x in range(int(cx - rx) - 1, int(cx + rx) + 2):
+                nx, ny = (x + 0.5 - cx) / rx, (y + 0.5 - cy) / ry
+                r2 = nx * nx + ny * ny
+                if r2 > 1:
+                    continue
+                if rampa:
+                    nz = math.sqrt(max(0.0, 1 - r2))
+                    d = max(0.0, min(0.999, nx * LUZ[0] + ny * LUZ[1] + nz * LUZ[2]))
+                    self.px[(x, y)] = rampa[int(d * len(rampa))]
+                else:
+                    self.px[(x, y)] = cor
+                feitos.append((x, y))
+        return feitos
+
+    def poligono(self, pts, rampa, luz="diag"):
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+        for y in range(int(math.floor(y0)), int(y1) + 1):
+            for x in range(int(math.floor(x0)), int(x1) + 1):
+                if _dentro(pts, x + 0.5, y + 0.5):
+                    u = (x + 0.5 - x0) / max(1e-9, x1 - x0)
+                    v = (y + 0.5 - y0) / max(1e-9, y1 - y0)
+                    d = 1 - v if luz == "vert" else 1 - (0.45 * u + 0.55 * v)
+                    d = max(0.0, min(0.999, d))
+                    self.px[(x, y)] = rampa[int(d * len(rampa))]
+
+    def ret(self, x0, y0, x1, y1, cor):
+        for y in range(int(y0), max(int(y0) + 1, int(y1))):
+            for x in range(int(x0), max(int(x0) + 1, int(x1))):
+                self.px[(x, y)] = cor
+
+    def linha(self, x0, y0, x1, y1, cor, grossura=1):
+        n = int(max(abs(x1 - x0), abs(y1 - y0))) + 1
+        for i in range(n + 1):
+            x, y = lerp(x0, x1, i / n), lerp(y0, y1, i / n)
+            for g in range(grossura):
+                self.px[(int(x) + g, int(y))] = cor
+
+    def contorno(self, cor):
+        mask = set(self.px)
+        borda = [p for p in mask if any(
+            (p[0] + dx, p[1] + dy) not in mask for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)))]
+        for p in borda:
+            self.px[p] = cor
+
+
+# ======================================================================== fonte
+FONTE = {
+    "A": ".###.#...#######...##...#", "B": "####.#...#####.#...#####.",
+    "C": ".#####....#....#.....####", "D": "####.#...##...##...#####.",
+    "E": "######....####.#....#####", "F": "######....####.#....#....",
+    "G": ".#####....#..###...#.###.", "H": "#...##...#######...##...#",
+    "I": "#####..#....#....#..#####", "J": "..###....#....##...#.###.",
+    "K": "#...##..#.###..#..#.#...#", "L": "#....#....#....#....#####",
+    "M": "#...###.###.#.##...##...#", "N": "#...###..##.#.##..###...#",
+    "O": ".###.#...##...##...#.###.", "P": "####.#...#####.#....#....",
+    "Q": ".###.#...##.#.##..#..##.#", "R": "####.#...#####.#..#.#...#",
+    "S": ".#####.....###.....#####.", "T": "#####..#....#....#....#..",
+    "U": "#...##...##...##...#.###.", "V": "#...##...##...#.#.#...#..",
+    "W": "#...##...##.#.###.###...#", "X": "#...#.#.#...#...#.#.#...#",
+    "Y": "#...#.#.#...#....#....#..", "Z": "#####...#...#...#...#####",
+    "0": ".###.#..###.#.###..#.###.", "1": "..#...##....#....#...###.",
+    "2": "####.....#.###.#....#####", "3": "####.....#.###.....#####.",
+    "4": "#...##...######....#....#", "5": "######....####.....#####.",
+    "6": ".###.#....####.#...#.###.", "7": "#####....#...#...#....#..",
+    "8": ".###.#...#.###.#...#.###.", "9": ".###.#...#.####....#.###.",
+    "!": "..#....#....#.........#..", "-": "..........###..........",
+    " ": "." * 25,
+}
+FONTE = {k: [v.ljust(25, ".")[i * 5:i * 5 + 5] for i in range(5)] for k, v in FONTE.items()}
+
+
+# ======================================================================== tela
+class Tela:
+    """Canvas de pixels; cada caractere do terminal mostra 2 pixels (meio bloco)."""
+
+    def __init__(self, estilo, tamanho=None):
+        self.cols, self.rows = tamanho or shutil.get_terminal_size((80, 24))
+        self.W, self.H = self.cols, self.rows * 2
+        self.estilo = estilo
+        self.px = [[(0, 0, 0)] * self.W for _ in range(self.H)]
+        self.textos = []
+
+    def c(self, cor):
+        return conv(cor, self.estilo)
+
+    def ceu(self, stops, bandas=12, y0=0, y1=None):
+        y1 = self.H if y1 is None else y1
+        for y in range(max(0, y0), min(self.H, y1)):
+            p = (y - y0) / max(1, y1 - y0 - 1) * bandas
+            i = int(p)
+            f = p - i
+            c0 = self.c(cor_em(stops, i / bandas))
+            c1 = self.c(cor_em(stops, min(bandas, i + 1) / bandas))
+            linha, b = self.px[y], BAYER[y % 4]
+            for x in range(self.W):
+                linha[x] = c1 if b[x % 4] / 16 < f else c0
+
+    def ponto(self, x, y, c):
+        x, y = int(x), int(y)
+        if 0 <= x < self.W and 0 <= y < self.H:
+            self.px[y][x] = self.c(c)
+
+    def misturar(self, x, y, c, a):
+        x, y = int(x), int(y)
+        if a > 0 and 0 <= x < self.W and 0 <= y < self.H:
+            self.px[y][x] = self.c(lerp_cor(self.px[y][x], c, a))
+
+    def brilho(self, cx, cy, r, cor, forca):
+        r = max(r, 0.5)
+        for y in range(int(cy - r), int(cy + r) + 1):
+            for x in range(int(cx - r), int(cx + r) + 1):
+                d = math.hypot(x - cx, y - cy) / r
+                if d < 1:
+                    self.misturar(x, y, cor, forca * (1 - d) ** 2)
+
+    def circulo(self, cx, cy, r, cor):
+        for y in range(int(cy - r) - 1, int(cy + r) + 2):
+            for x in range(int(cx - r) - 1, int(cx + r) + 2):
+                if (x + 0.5 - cx) ** 2 + (y + 0.5 - cy) ** 2 <= r * r:
+                    self.ponto(x, y, cor)
+
+    def retangulo(self, x0, y0, x1, y1, cor):
+        c = self.c(cor)
+        for y in range(max(0, int(y0)), min(self.H, int(y1))):
+            linha = self.px[y]
+            for x in range(max(0, int(x0)), min(self.W, int(x1))):
+                linha[x] = c
+
+    def poligono(self, pts, cor):
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        c = self.c(cor)
+        for y in range(max(0, int(min(ys))), min(self.H, int(max(ys)) + 1)):
+            for x in range(max(0, int(min(xs))), min(self.W, int(max(xs)) + 1)):
+                if _dentro(pts, x + 0.5, y + 0.5):
+                    self.px[y][x] = c
+
+    def linha(self, x0, y0, x1, y1, cor, alfa=1.0):
+        n = int(max(abs(x1 - x0), abs(y1 - y0))) + 1
+        for i in range(n + 1):
+            self.misturar(lerp(x0, x1, i / n), lerp(y0, y1, i / n), cor, alfa)
+
+    def sombra(self, cx, cy, rx, ry, forca=0.35):
+        for y in range(int(cy - ry), int(cy + ry) + 1):
+            for x in range(int(cx - rx), int(cx + rx) + 1):
+                if ((x - cx) / max(rx, 0.5)) ** 2 + ((y - cy) / max(ry, 0.5)) ** 2 <= 1:
+                    self.misturar(x, y, (0, 0, 0), forca)
+
+    def desenhar(self, spr, x, y, tinta=None, forca_tinta=0.6):
+        x, y = int(x), int(y)
+        for (px, py), c in spr.px.items():
+            self.ponto(x + px, y + py, lerp_cor(c, tinta, forca_tinta) if tinta else c)
+
+    def flash(self, a, cor=(255, 255, 255)):
+        if a <= 0:
+            return
+        if a >= 1:
+            c = self.c(cor)
+            for y in range(self.H):
+                self.px[y] = [c] * self.W
+            return
+        for y in range(self.H):
+            for x in range(self.W):
+                self.misturar(x, y, cor, a)
+
+    def letra(self, ch, x, y, s, cor, inclinacao=0.0):
+        glifo = FONTE.get(ch, FONTE[" "])
+        for j, linha in enumerate(glifo):
+            desvio = int(round((4 - j) * s * inclinacao))
+            for i, v in enumerate(linha):
+                if v != "#":
+                    continue
+                for dy in range(s):
+                    for dx in range(s):
+                        X, Y = int(x) + i * s + dx + desvio, int(y) + j * s + dy
+                        self.ponto(X, Y, cor(X, Y, (j * s + dy) / (5 * s)) if callable(cor) else cor)
+
+    def texto(self, linha, s, cor):
+        self.textos.append((int(linha), s, cor))
+
+    def render(self):
+        txt = {}
+        for row, s, cor in self.textos:
+            if 0 <= row < self.rows:
+                s = s[: self.cols]
+                c0 = (self.cols - len(s)) // 2
+                for i, ch in enumerate(s):
+                    txt[(row, c0 + i)] = (ch, self.c(cor))
+        out = []
+        for row in range(self.rows):
+            out.append(f"\x1b[{row + 1};1H")
+            ant = None
+            topo, base = self.px[2 * row], self.px[2 * row + 1]
+            for x in range(self.cols):
+                if (row, x) in txt:
+                    ch, fg = txt[(row, x)]
+                    bg = topo[x]
+                else:
+                    ch, fg, bg = "▀", topo[x], base[x]
+                if (fg, bg) != ant:
+                    out.append("\x1b[38;2;%d;%d;%dm\x1b[48;2;%d;%d;%dm" % (fg + bg))
+                    ant = (fg, bg)
+                out.append(ch)
+        out.append("\x1b[0m")
+        return "".join(out)
+
+
+# ======================================================================== título
+def titulo(tela, linhas, t, t0, cores, contorno=(30, 12, 22), sombra=(70, 20, 30),
+           y0=None, entrada="cair", inclinacao=0.0, brilho_periodo=3.0):
+    """Desenha o título em pixel art. Devolve o y (em pixels) logo abaixo dele."""
+    maior = max(len(l) for l in linhas)
+    ts = int(min((tela.W - 6) / (maior * 6 - 1 + 6 * inclinacao), (tela.H * 0.42) / (len(linhas) * 7)))
+    yf = int(tela.H * 0.07) if y0 is None else y0
+    if ts < 1:
+        for i, l in enumerate(linhas):
+            if t >= t0:
+                tela.texto(yf // 2 + i, l, cores[0])
+        return yf + len(linhas) * 2 + 2
+    brilho_x = ((t - t0 - 1.0) % brilho_periodo) / brilho_periodo * (tela.W + 60) - 30
+
+    def preencher(X, Y, f):
+        c = cor_em([(i / (len(cores) - 1), c) for i, c in enumerate(cores)], f)
+        if t - t0 > 1.0 and abs((X + Y * 0.6) - brilho_x) < 2.2 * ts:
+            c = clarear(c, 0.7)
+        return c
+
+    for i, linha in enumerate(linhas):
+        largura = (len(linha) * 6 - 1) * ts
+        xf = (tela.W - largura) // 2
+        yl = yf + i * 7 * ts
+        for n, ch in enumerate(linha):
+            x, y = xf + n * 6 * ts, yl
+            if entrada == "cair":
+                q = (t - t0 - i * 0.25) / 0.8
+                y = lerp(-8 * ts, yl, ease(q))
+            elif entrada == "deslizar":
+                q = (t - t0 - i * 0.3) / 0.7
+                ini = -largura - 10 if i % 2 == 0 else tela.W + 10
+                x = lerp(ini + n * 6 * ts, xf + n * 6 * ts, ease(q))
+            elif entrada == "revelar":
+                q = t - t0 - (i * len(linha) + n) * 0.07
+                if q < 0:
+                    continue
+                if q < 0.15:
+                    tela.letra(ch, x, y, ts, (255, 255, 255), inclinacao)
+                    continue
+            tela.letra(ch, x + ts, y + ts, ts, sombra, inclinacao)
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, 1), (-1, 1), (1, -1)):
+                tela.letra(ch, x + dx, y + dy, ts, contorno, inclinacao)
+            tela.letra(ch, x, y, ts, preencher, inclinacao)
+    return yf + len(linhas) * 7 * ts
+
+
+def rodape(tela, t, t_sub, subtitulo, linha_sub, t_start):
+    if t >= t_sub:
+        tela.texto(linha_sub, subtitulo, (255, 255, 255))
+    if t >= t_start and int(t * 2) % 2 == 0:
+        tela.texto(tela.rows - 2, "PRESS START", (255, 255, 255))
+
+
+RNG = random.Random(7)
+ESTRELAS = [(RNG.random(), RNG.random(), RNG.random() * 6.28, RNG.random()) for _ in range(120)]
+
+
+def estrelas(tela, t, limite=1.0, vel=0.0):
+    for fx, fy, fase, prof in ESTRELAS:
+        if fy > limite:
+            continue
+        x = (fx * tela.W - t * vel * (0.3 + prof)) % tela.W
+        b = 0.5 + 0.5 * math.sin(t * 3 + fase)
+        tela.ponto(x, fy * tela.H, lerp_cor((70, 70, 130), (255, 255, 235), b * (0.4 + 0.6 * prof)))
+
+# ======================================================================== ELEMENTRA
+@functools.lru_cache(maxsize=32)
+def fofolume(h, piscando=False):
+    """Bolinha fofa com uma estrela flutuando na cabeça."""
+    w = h
+    s = Spr(w, h)
+    creme = [(150, 118, 95), (205, 183, 152), (240, 228, 200), (255, 250, 236)]
+    pe = [(120, 90, 70), (170, 140, 110), (205, 178, 148)]
+    s.elipse(w * 0.32, h * 0.92, w * 0.12, h * 0.07, pe)
+    s.elipse(w * 0.68, h * 0.92, w * 0.12, h * 0.07, pe)
+    s.elipse(w * 0.5, h * 0.6, w * 0.42, h * 0.34, creme)
+    cx, cy, R = w * 0.5, h * 0.17, h * 0.16
+    pts = []
+    for k in range(10):
+        a = -math.pi / 2 + k * math.pi / 5
+        r = R if k % 2 == 0 else R * 0.45
+        pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+    s.poligono(pts, [(205, 135, 25), (240, 185, 45), (255, 222, 85), (255, 246, 175)])
+    s.contorno((60, 40, 32))
+    for ex in (0.36, 0.64):
+        if piscando:
+            y = int(h * 0.6)
+            for x in range(int(w * ex - w * 0.06), int(w * ex + w * 0.06) + 1):
+                s.px[(x, y)] = (25, 20, 35)
+        else:
+            olho = s.elipse(w * ex, h * 0.58, w * 0.06, h * 0.09, cor=(25, 20, 35))
+            if olho and h >= 14:
+                s.px[min(olho, key=lambda p: (p[1], p[0]))] = (255, 255, 255)
+    for bx in (0.22, 0.78):
+        s.elipse(w * bx, h * 0.7, w * 0.06, h * 0.035, cor=(245, 145, 165))
+    my, mx = int(h * 0.73), int(w * 0.5)
+    for dx in (-1, 0):
+        s.px[(mx + dx, my)] = (125, 50, 60)
+    return s
+
+
+@functools.lru_cache(maxsize=32)
+def cubrasa(h, asa=0):
+    """Cubo alado de um olho só."""
+    w = h
+    s = Spr(w, h)
+    ramp_asa = [(50, 28, 80), (82, 48, 122), (118, 76, 165)]
+    sobe = -0.06 * h if asa else 0
+    for lado in (1, -1):
+        X = lambda u: w * 0.5 + lado * (u - 0.5) * w
+        pts = [(X(0.3), h * 0.36), (X(0.02), h * 0.1 + sobe), (X(0.08), h * 0.34 + sobe),
+               (X(0.0), h * 0.5 + sobe), (X(0.1), h * 0.52), (X(0.06), h * 0.66), (X(0.3), h * 0.62)]
+        s.poligono(pts, ramp_asa)
+        s.poligono([(X(0.3), h * 0.25), (X(0.25), h * 0.07), (X(0.41), h * 0.25)],
+                   [(70, 45, 45), (120, 88, 76), (170, 140, 118)])
+    corpo = [(48, 52, 138), (78, 88, 188), (112, 124, 230), (162, 172, 252)]
+    x0, x1, y0, y1 = w * 0.26, w * 0.74, h * 0.22, h * 0.84
+    rr = w * 0.08
+    for y in range(int(y0), int(y1)):
+        for x in range(int(x0), int(x1)):
+            cx = min(max(x + 0.5, x0 + rr), x1 - rr)
+            cy = min(max(y + 0.5, y0 + rr), y1 - rr)
+            if (x + 0.5 - cx) ** 2 + (y + 0.5 - cy) ** 2 > rr * rr:
+                continue
+            u, v = (x - x0) / (x1 - x0), (y - y0) / (y1 - y0)
+            d = 1 - (0.6 * u + 0.4 * v) + (0.25 if (u < 0.12 or v < 0.08) else 0)
+            s.px[(x, y)] = corpo[max(0, min(3, int(d * 4)))]
+    for fx in (0.36, 0.64):
+        s.ret(w * fx - w * 0.04, h * 0.84, w * fx + w * 0.04 + 1, h * 0.95, (40, 36, 92))
+    s.contorno((24, 14, 44))
+    s.elipse(w * 0.5, h * 0.47, w * 0.15, h * 0.13, cor=(238, 238, 250))
+    iris = s.elipse(w * 0.5, h * 0.47, w * 0.09, h * 0.1, [(150, 20, 30), (220, 52, 52), (255, 112, 92)])
+    s.elipse(w * 0.5, h * 0.48, w * 0.035, h * 0.055, cor=(20, 10, 20))
+    if iris and h >= 14:
+        s.px[min(iris, key=lambda p: (p[1], p[0]))] = (255, 255, 255)
+    for x in range(int(w * 0.43), int(w * 0.57) + 1):
+        s.px[(x, int(h * 0.7))] = (30, 22, 70)
+    return s
+
+
+TUFOS = [(RNG.random(), RNG.random()) for _ in range(40)]
+NUVENS = [(RNG.random(), 0.08 + RNG.random() * 0.25, 0.5 + RNG.random() * 0.6) for _ in range(5)]
+
+
+def montanhas(tela, base, alt, off, cor, seed, neve=None):
+    W = tela.W
+
+    def h(x):
+        u = (x + off) / max(1, W) * 6.283
+        return alt * (0.6 + 0.22 * math.sin(u * 1.3 + seed) + 0.13 * math.sin(u * 3.1 + seed * 2.1)
+                      + 0.05 * math.sin(u * 7.7 + seed * 3.3))
+
+    c_luz, c_sombra = tela.c(clarear(cor, 0.14)), tela.c(cor)
+    c_neve = tela.c(neve) if neve else None
+    for x in range(W):
+        hx = h(x)
+        topo = int(base - hx)
+        c = c_luz if h(x + 1) > hx else c_sombra
+        for y in range(max(0, topo), min(tela.H, int(base) + 1)):
+            tela.px[y][x] = c_neve if (neve and y < topo + max(1, alt * 0.14) and hx > alt * 0.74) else c
+
+
+def nuvens(tela, t, vel=1.5):
+    for fx, fy, k in NUVENS:
+        r = max(1.5, tela.H * 0.05 * k)
+        cx = (fx * (tela.W + 6 * r) + t * vel * k) % (tela.W + 6 * r) - 3 * r
+        cy = fy * tela.H
+        for dx, dy, f in ((-r * 0.9, r * 0.25, 0.7), (r * 0.9, r * 0.3, 0.75), (0, 0, 1.0), (r * 0.35, -r * 0.4, 0.65)):
+            ccx, ccy, rr = cx + dx, cy + dy, r * f
+            for y in range(int(ccy - rr), int(ccy + rr) + 1):
+                for x in range(int(ccx - rr), int(ccx + rr) + 1):
+                    if (x + 0.5 - ccx) ** 2 + (y + 0.5 - ccy) ** 2 <= rr * rr:
+                        tela.ponto(x, y, (255, 255, 255) if y < cy + r * 0.25 else (206, 218, 238))
+
+
+def gramado(tela, off, gy, c1=(66, 142, 58), c2=(112, 192, 82)):
+    for y in range(max(0, gy), tela.H):
+        p = (y - gy) / max(1, tela.H - gy)
+        base = tela.c(lerp_cor(c1, c2, p))
+        escuro = tela.c(escurecer(lerp_cor(c1, c2, p), 0.14))
+        linha = tela.px[y]
+        o = int(off * (0.5 + p)) + y * 3
+        for x in range(tela.W):
+            linha[x] = escuro if (x + o) % 7 == 0 else base
+    if 0 <= gy < tela.H:
+        tela.retangulo(0, gy, tela.W, gy + 1, escurecer(c1, 0.25))
+    for fx, fy in TUFOS:
+        x = (fx * tela.W - off * 1.2) % tela.W
+        y = gy + 2 + fy * (tela.H - gy - 3)
+        tela.ponto(x, y, escurecer(c1, 0.3))
+        tela.ponto(x + 1, y - 1, escurecer(c1, 0.3))
+
+
+def tam_criatura(tela, teto=None):
+    h = int(min(tela.H * 0.42, tela.W * 0.26))
+    if teto is not None:
+        h = min(h, teto)
+    return max(0, min(h, 64))
+
+
+CEU_NOITE = [(0, (2, 3, 16)), (0.65, (22, 16, 62)), (1, (60, 32, 95))]
+CEU_DIA = [(0, (64, 120, 225)), (0.6, (145, 196, 250)), (1, (222, 240, 255))]
+CEU_POR = [(0, (36, 18, 86)), (0.35, (148, 58, 118)), (0.62, (248, 128, 70)), (1, (255, 214, 125))]
+
+
+def elementra(tela, t):
+    if t < 4.0:
+        tela.ceu(CEU_NOITE)
+        estrelas(tela, t, 0.8)
+        lx, ly, lr = tela.W * 0.8, tela.H * 0.22, max(2, tela.H * 0.09)
+        tela.brilho(lx, ly, lr * 3, (200, 210, 255), 0.35)
+        tela.circulo(lx, ly, lr, (235, 235, 220))
+        tela.circulo(lx - lr * 0.3, ly - lr * 0.2, lr * 0.25, (205, 205, 195))
+        tela.circulo(lx + lr * 0.35, ly + lr * 0.3, lr * 0.18, (205, 205, 195))
+        montanhas(tela, tela.H, tela.H * 0.22, t * 2, (18, 14, 40), 1.0)
+        p = (t - 0.4) / 2.2
+        if 0 <= p <= 1:
+            x0, y0, x1, y1 = tela.W * 1.05, tela.H * 0.02, tela.W * 0.15, tela.H * 0.6
+            for k in range(18):
+                q = p - k * 0.01
+                if q < 0:
+                    break
+                x, y = lerp(x0, x1, q), lerp(y0, y1, q)
+                tela.misturar(x, y, (255, 250, 210), 1 - k / 18)
+                tela.misturar(x, y + 1, (180, 160, 255), 0.6 * (1 - k / 18))
+            tela.brilho(lerp(x0, x1, p), lerp(y0, y1, p), 4, (255, 255, 220), 0.9)
+        if 1.4 <= t <= 3.9:
+            a = min(1, (t - 1.4) / 0.5, (3.9 - t) / 0.5)
+            tela.texto(tela.rows // 2, "uma produção TERMINAL", lerp_cor((22, 16, 62), (230, 230, 255), a))
+        return
+
+    if t < 12.0:
+        pan = (1 - ease((t - 4) / 2.0)) * tela.W * 0.6
+        tela.ceu(CEU_DIA)
+        tela.brilho(tela.W * 0.15, tela.H * 0.12, tela.H * 0.3, (255, 250, 210), 0.5)
+        nuvens(tela, t)
+        gy = int(tela.H * 0.74)
+        montanhas(tela, gy, tela.H * 0.4, pan * 0.2 + 10, (120, 150, 200), 0.5, neve=(240, 245, 255))
+        montanhas(tela, gy, tela.H * 0.22, pan * 0.5 + 40, (70, 130, 90), 2.3)
+        gramado(tela, pan, gy)
+        h = tam_criatura(tela)
+        if h < 8:
+            return
+        xa_f, xb_f = tela.W * 0.27 - h / 2, tela.W * 0.73 - h / 2
+        e = ease((t - 4.2) / 1.5)
+        xa, xb = lerp(-h * 1.2, xa_f, e), lerp(tela.W + h * 0.2, xb_f, e)
+        ya = yb = gy - h + max(1, h // 10)
+        if 5.7 <= t < 10.0:
+            ya -= abs(math.sin((t - 5.7) * 5)) * h * 0.08
+            yb -= abs(math.sin((t - 5.7) * 5 + 1.4)) * h * 0.08
+        dano = 9.0 <= t < 9.8
+        if dano:
+            xb += math.sin(t * 60) * h * 0.06 + h * 0.15 * (1 - (t - 9.0) / 0.8)
+        if t >= 10.0:
+            c = ease((t - 10.0) / 1.2)
+            xa, xb = lerp(xa_f, tela.W / 2 - h * 0.95, c), lerp(xb_f, tela.W / 2 - h * 0.05, c)
+        tela.sombra(xa + h / 2, gy + 1, h * 0.4, max(1, h * 0.08))
+        tela.sombra(xb + h / 2, gy + 1, h * 0.35, max(1, h * 0.08))
+        if 7.0 <= t < 8.0:
+            tela.brilho(xa + h / 2, ya + h * 0.6, h * (0.7 + 0.2 * math.sin(t * 25)), (255, 230, 120), 0.6)
+        tela.desenhar(fofolume(h, (t % 2.7) < 0.12), xa, ya)
+        tinta = (255, 80, 80) if dano and int(t * 15) % 2 == 0 else None
+        tela.desenhar(cubrasa(h, int(t * 6) % 2), xb, yb, tinta)
+        if 8.0 <= t < 9.0:
+            q = ease((t - 8.0) / 1.0)
+            for k in range(1, 6):
+                qq = max(0, q - k * 0.05)
+                tela.brilho(lerp(xa + h * 0.8, xb + h * 0.3, qq), ya + h * 0.55 - math.sin(qq * math.pi) * h * 0.3,
+                            h * 0.15, (255, 220, 120), 0.5 * (1 - k / 6))
+            ox, oy = lerp(xa + h * 0.8, xb + h * 0.3, q), ya + h * 0.55 - math.sin(q * math.pi) * h * 0.3
+            tela.brilho(ox, oy, h * 0.4, (255, 235, 150), 0.9)
+            tela.circulo(ox, oy, max(1, h * 0.08), (255, 255, 240))
+        if 9.0 <= t < 10.0:
+            q = t - 9.0
+            cx, cy = xb_f + h * 0.4, ya + h * 0.5
+            for k in range(14):
+                ang = k * 2 * math.pi / 14 + 0.3
+                d = q * h * (1.0 + 0.4 * (k % 3))
+                tela.brilho(cx + math.cos(ang) * d, cy + math.sin(ang) * d * 0.7, max(1.5, h * 0.06),
+                            (255, 200, 90) if k % 2 else (255, 255, 230), 1 - q)
+        if t >= 11.2:
+            a = (t - 11.2) / 0.8
+            if int(t * 15) % 2 == 0 or a > 0.6:
+                tela.flash(max(a, 0.7))
+        return
+
+    tela.ceu(CEU_POR)
+    sx, sy = tela.W * 0.5, tela.H * 0.62
+    for y in range(int(sy) + 1):
+        for x in range(tela.W):
+            if (math.atan2(y - sy, x - sx) * 12 / (2 * math.pi) + t * 0.25) % 1 < 0.5:
+                tela.misturar(x, y, (255, 240, 200), 0.13)
+    estrelas(tela, t, limite=0.18)
+    tela.brilho(sx, sy, tela.H * 0.4, (255, 225, 150), 0.6)
+    tela.circulo(sx, sy, max(2, tela.H * 0.11), (255, 238, 175))
+    gy = int(tela.H * 0.78)
+    montanhas(tela, gy, tela.H * 0.32, t * 1.5, (92, 48, 110), 0.8)
+    montanhas(tela, gy, tela.H * 0.18, t * 4, (58, 30, 78), 2.9)
+    gramado(tela, t * 8, gy, (40, 70, 60), (70, 110, 80))
+    if t < 12.4:
+        tela.flash(1 - (t - 12.0) / 0.4)
+    fim = titulo(tela, ["ELEMENTRA"], t, 12.2, [(255, 246, 150), (240, 110, 30)])
+    h = tam_criatura(tela, teto=gy - fim - 4)
+    if h >= 8 and t >= 13.0:
+        sobe = (1 - ease((t - 13.0) / 0.8)) * h
+        tela.sombra(tela.W * 0.16 + h / 2, gy + 1, h * 0.4, max(1, h * 0.08))
+        tela.sombra(tela.W * 0.84 - h / 2, gy + 1, h * 0.35, max(1, h * 0.08))
+        tela.desenhar(fofolume(h, (t % 3.1) < 0.12), tela.W * 0.16, gy - h + max(1, h // 10) + sobe)
+        tela.desenhar(cubrasa(h, int(t * 5) % 2), tela.W * 0.84 - h, gy - h + max(1, h // 10) + sobe)
+    for k in range(8):
+        fase = (t * 0.6 + k * 0.137) % 1
+        px = ((k * 0.31 + 0.05) % 1) * tela.W
+        tela.brilho(px + math.sin(t * 2 + k) * 2, lerp(gy, tela.H * 0.05, fase), 1.6, (255, 250, 210), 0.9 * (1 - fase))
+    versao = {"gb": "VERSÃO MUSGO", "gbc": "VERSÃO BRASA", "gba": "VERSÃO MARÉ"}[tela.estilo]
+    rodape(tela, t, 13.6, versao, fim // 2 + 1, 14.4)
+
+# ======================================================================== TURBO ASFALTO
+@functools.lru_cache(maxsize=64)
+def carro(w, cor):
+    """Carro esportivo visto de trás."""
+    w = max(6, int(w))
+    h = max(4, int(w * 0.5))
+    s = Spr(w, h)
+    rampa = [escurecer(cor, 0.45), escurecer(cor, 0.2), cor, clarear(cor, 0.3)]
+    for fx in (0.06, 0.74):
+        s.ret(w * fx, h * 0.62, w * (fx + 0.2), h, (22, 22, 28))
+        s.ret(w * fx, h * 0.66, w * (fx + 0.2), h * 0.66 + 1, (60, 60, 70))
+    s.poligono([(w * 0.02, h * 0.45), (w * 0.98, h * 0.45), (w * 0.96, h * 0.86), (w * 0.04, h * 0.86)], rampa, "vert")
+    s.poligono([(w * 0.22, h * 0.1), (w * 0.78, h * 0.1), (w * 0.9, h * 0.47), (w * 0.1, h * 0.47)], rampa, "vert")
+    s.poligono([(w * 0.27, h * 0.16), (w * 0.73, h * 0.16), (w * 0.82, h * 0.42), (w * 0.18, h * 0.42)],
+               [(25, 32, 60), (45, 62, 105), (80, 108, 160), (150, 180, 220)], "vert")
+    s.ret(0, h * 0.28, w, h * 0.35, escurecer(cor, 0.55))
+    s.ret(w * 0.12, h * 0.35, w * 0.16, h * 0.45, escurecer(cor, 0.55))
+    s.ret(w * 0.84, h * 0.35, w * 0.88, h * 0.45, escurecer(cor, 0.55))
+    s.contorno((18, 10, 16))
+    for fx in (0.07, 0.73):
+        s.ret(w * fx, h * 0.52, w * (fx + 0.2), h * 0.62, (255, 50, 50))
+        s.ret(w * fx, h * 0.52, w * (fx + 0.2), h * 0.52 + 1, (255, 170, 160))
+    s.ret(w * 0.4, h * 0.6, w * 0.6, h * 0.72, (230, 228, 205))
+    return s
+
+
+PREDIOS = [(RNG.random(), 0.03 + RNG.random() * 0.05, 0.2 + RNG.random() * 0.8, RNG.randint(0, 999)) for _ in range(28)]
+CEU_CORRIDA = [(0, (28, 18, 78)), (0.45, (190, 64, 112)), (0.8, (255, 146, 80)), (1, (255, 222, 140))]
+
+
+def turbo_posicao(t):
+    pos, v, passo, x = 0.0, 0.0, 0.05, 3.0
+    while x < t:
+        if x < 5.0:
+            v = 6 * ease((x - 3.0) / 2.0)
+        elif 8.0 <= x < 10.5:
+            v = 6 + 5 * ease((x - 8.0) / 0.6)
+        else:
+            v = 6
+        pos += v * passo
+        x += passo
+    return pos
+
+
+def turbo_pista(tela, pos, curva, hz):
+    W, H = tela.W, tela.H
+    tela.ceu(CEU_CORRIDA, y1=hz + 1)
+    sx = W * 0.5 - curva * W * 0.25
+    r = max(3, H * 0.17)
+    tela.brilho(sx, hz, r * 2.6, (255, 190, 120), 0.55)
+    for y in range(int(hz - r), hz + 1):
+        if y > hz - r * 0.55 and y % 3 == 0:
+            continue
+        for x in range(int(sx - r), int(sx + r) + 1):
+            if (x + 0.5 - sx) ** 2 + (y + 0.5 - hz) ** 2 <= r * r:
+                tela.ponto(x, y, lerp_cor((255, 236, 120), (255, 110, 90), (y - (hz - r)) / r))
+    largura = W * 1.6
+    c_pred, c_jan = (38, 22, 66), (255, 205, 120)
+    for fx, fw, fh, sem in PREDIOS:
+        bx = (fx * largura - curva * W * 0.35) % largura - W * 0.3
+        bw, bh = max(2, fw * W), fh * H * 0.22
+        tela.retangulo(bx, hz - bh, bx + bw, hz + 1, c_pred)
+        for yy in range(int(hz - bh) + 1, hz - 1, 2):
+            for xx in range(int(bx) + 1, int(bx + bw) - 1, 2):
+                if _hash(xx + sem, yy) > 0.62:
+                    tela.ponto(xx, yy, c_jan)
+    cores = {k: tela.c(v) for k, v in {
+        "g1": (72, 170, 72), "g2": (58, 148, 58), "a1": (104, 104, 116), "a2": (94, 94, 106),
+        "z1": (236, 236, 236), "z2": (214, 42, 42), "faixa": (245, 245, 245)}.items()}
+    for y in range(hz + 1, H):
+        p = (y - hz) / max(1, H - hz)
+        z = 1 / max(p, 0.02)
+        meia = W * 0.03 + p * W * 0.5
+        cx = W / 2 + curva * W * 0.7 * (1 - p) ** 2
+        fase = int(z * 2.2 + pos) % 2
+        g, a, zb = (cores["g1"], cores["a1"], cores["z1"]) if fase else (cores["g2"], cores["a2"], cores["z2"])
+        linha = tela.px[y]
+        for x in range(W):
+            d = abs(x + 0.5 - cx)
+            if d < meia * 0.035 and fase:
+                linha[x] = cores["faixa"]
+            elif d < meia:
+                linha[x] = a
+            elif d < meia * 1.13:
+                linha[x] = zb
+            else:
+                linha[x] = g
+
+
+def turbo(tela, t):
+    W, H = tela.W, tela.H
+    hz = int(H * 0.42)
+    cw = int(min(W * 0.3, H * 0.75))
+    if t < 11.0:
+        pos = turbo_posicao(t) if t > 3 else 0.0
+        curva = math.sin((t - 3) * 0.45) * 0.8 if t > 3 else 0.0
+        turbo_pista(tela, pos, curva, hz)
+        cx_carro = W / 2 + curva * W * 0.04 + (math.sin(t * 9) * 0.5 if t > 3 else 0)
+        y_carro = H - int(cw * 0.5) - 1 + (int(t * 12) % 2 if t > 3 else 0)
+        if 5.0 <= t < 8.5:
+            q = ((t - 5.0) / 3.5) ** 1.6
+            p = lerp(0.1, 1.25, q)
+            ycar = hz + p * (H - hz)
+            meia = W * 0.03 + p * W * 0.5
+            cxr = W / 2 + curva * W * 0.7 * (1 - min(p, 1)) ** 2 - meia * 0.5
+            wr = max(6, cw * p)
+            if p < 1.0:
+                tela.desenhar(carro(int(wr), (40, 96, 220)), cxr - wr / 2, ycar - wr * 0.5)
+        tela.sombra(cx_carro, H - 1, cw * 0.5, max(1, cw * 0.06), 0.4)
+        tela.desenhar(carro(cw, (220, 36, 48)), cx_carro - cw / 2, y_carro)
+        for fx in (0.17, 0.83):
+            tela.brilho(cx_carro - cw / 2 + cw * fx, y_carro + cw * 0.28, cw * 0.12, (255, 60, 60), 0.5)
+        if 8.0 <= t < 10.5:
+            for k in range(2):
+                fl = cw * (0.12 + 0.06 * math.sin(t * 40 + k))
+                bx = cx_carro + (k - 0.5) * cw * 0.3
+                by = y_carro + cw * 0.46
+                tela.brilho(bx, by, fl * 1.6, (120, 170, 255), 0.9)
+                tela.brilho(bx, by, fl * 0.7, (255, 255, 255), 0.9)
+            for k in range(24):
+                ang = k * 2 * math.pi / 24 + _hash(k, 3) * 0.3
+                fase = (t * 2.5 + _hash(k, 9)) % 1
+                r1, r2 = lerp(0.2, 1.3, fase) * W, lerp(0.3, 1.5, fase) * W
+                if math.sin(ang) > -0.2:
+                    tela.linha(W / 2 + math.cos(ang) * r1 * 0.5, hz + math.sin(ang) * r1 * 0.3,
+                               W / 2 + math.cos(ang) * r2 * 0.5, hz + math.sin(ang) * r2 * 0.3, (255, 255, 255), 0.5)
+        if t < 3.0:
+            tela.flash(0.35, (0, 0, 0))
+            lw, lh = W * 0.22, H * 0.14
+            lx, ly = W / 2 - lw / 2, H * 0.05
+            tela.retangulo(lx, ly, lx + lw, ly + lh, (25, 25, 32))
+            tela.retangulo(lx, ly, lx + lw, ly + 1, (90, 90, 100))
+            acesas = 0 if t < 0.7 else 1 if t < 1.4 else 2 if t < 2.1 else 3
+            for i in range(3):
+                bx, by, br = lx + lw * (0.2 + 0.3 * i), ly + lh / 2, max(1.2, lh * 0.32)
+                verde = t >= 2.7
+                cor = (60, 255, 90) if verde else (255, 40, 40) if i < acesas else (70, 20, 20)
+                if verde or i < acesas:
+                    tela.brilho(bx, by, br * 3, cor, 0.6)
+                tela.circulo(bx, by, br, cor)
+            num = "GO!" if t >= 2.7 else str(3 - acesas + 1) if acesas else ""
+            if num and acesas:
+                s = max(1, int(H * 0.06))
+                larg = (len(num) * 6 - 1) * s
+                for n, ch in enumerate(num):
+                    x, y = W / 2 - larg / 2 + n * 6 * s, H * 0.24
+                    tela.letra(ch, x + s, y + s, s, (40, 10, 10))
+                    tela.letra(ch, x, y, s, (255, 240, 120) if num != "GO!" else (120, 255, 140))
+        if t >= 10.4:
+            tela.flash((t - 10.4) / 0.6)
+        return
+
+    # tela de título: horizonte neon
+    hz2 = int(H * 0.56)
+    tela.ceu([(0, (14, 4, 40)), (0.7, (110, 20, 120)), (1, (255, 90, 150))], y1=hz2)
+    estrelas(tela, t, 0.35)
+    sx, r = W / 2, max(3, H * 0.2)
+    for y in range(int(hz2 - r), hz2):
+        if y > hz2 - r * 0.6 and y % 3 == 0:
+            continue
+        for x in range(int(sx - r), int(sx + r) + 1):
+            if (x + 0.5 - sx) ** 2 + (y + 0.5 - hz2) ** 2 <= r * r:
+                tela.ponto(x, y, lerp_cor((255, 230, 90), (255, 60, 140), (y - (hz2 - r)) / r))
+    tela.retangulo(0, hz2, W, H, (16, 4, 34))
+    neon = (255, 70, 210)
+    for y in range(hz2, H):
+        p = (y - hz2 + 0.5) / max(1, H - hz2)
+        z0, z1 = 1 / (p + 0.04), 1 / (p + 1 / max(1, H - hz2) + 0.04)
+        if int(z0 * 1.2 + t * 3) != int(z1 * 1.2 + t * 3):
+            tela.retangulo(0, y, W, y + 1, lerp_cor((90, 20, 110), neon, p + 0.3))
+        for k in range(-14, 15):
+            x = W / 2 + k * W * 0.11 * (0.06 + p * 1.4)
+            tela.ponto(x, y, lerp_cor((90, 20, 110), neon, p + 0.3))
+    tela.brilho(W / 2, hz2, W * 0.5, (255, 90, 200), 0.25)
+    if t < 11.4:
+        tela.flash(1 - (t - 11.0) / 0.4)
+    fim = titulo(tela, ["TURBO", "ASFALTO"], t, 11.2,
+                 [(255, 255, 255), (170, 210, 255), (50, 80, 170), (255, 150, 60), (255, 230, 140)],
+                 contorno=(10, 8, 40), sombra=(60, 10, 70), entrada="deslizar", inclinacao=0.35)
+    if t >= 12.4:
+        ch = int(min(W * 0.26, (H - fim) * 1.1))
+        if ch >= 8:
+            q = ease((t - 12.4) / 0.8)
+            y = lerp(H + 2, H - ch * 0.5 - 1, q)
+            tela.desenhar(carro(ch, (220, 36, 48)), W / 2 - ch / 2, y)
+            for fx in (0.17, 0.83):
+                tela.brilho(W / 2 - ch / 2 + ch * fx, y + ch * 0.28, ch * 0.14, (255, 60, 60), 0.5)
+    rodape(tela, t, 12.8, "CAMPEONATO MUNDIAL", fim // 2 + 1, 13.6)
+
+# ======================================================================== ASTRO VÉRTICE
+@functools.lru_cache(maxsize=16)
+def nave(h):
+    """Nave caça apontando para a direita."""
+    h = max(5, int(h))
+    w = int(h * 1.8)
+    s = Spr(w, h)
+    casco = [(70, 80, 100), (130, 142, 165), (190, 200, 220), (240, 244, 250)]
+    asa = [(40, 60, 120), (70, 100, 180), (110, 150, 230)]
+    s.poligono([(w * 0.58, h * 0.36), (w * 0.28, h * 0.0), (w * 0.14, h * 0.02), (w * 0.22, h * 0.38)], asa)
+    s.poligono([(w * 0.58, h * 0.64), (w * 0.28, h * 1.0), (w * 0.14, h * 0.98), (w * 0.22, h * 0.62)], asa)
+    s.poligono([(w * 1.0, h * 0.52), (w * 0.6, h * 0.3), (w * 0.15, h * 0.32), (w * 0.02, h * 0.42),
+                (w * 0.02, h * 0.6), (w * 0.15, h * 0.7), (w * 0.6, h * 0.72)], casco)
+    s.ret(0, h * 0.4, w * 0.05, h * 0.62, (40, 40, 55))
+    s.contorno((15, 18, 30))
+    s.elipse(w * 0.64, h * 0.46, w * 0.1, h * 0.09, [(20, 80, 110), (40, 160, 200), (120, 230, 255)])
+    s.ret(w * 0.24, h * 0.06, w * 0.3, h * 0.12, (255, 120, 40))
+    s.ret(w * 0.24, h * 0.88, w * 0.3, h * 0.94, (255, 120, 40))
+    s.ret(w * 0.3, h * 0.5, w * 0.62, h * 0.5 + 1, (255, 140, 60))
+    return s
+
+
+@functools.lru_cache(maxsize=16)
+def drone(h):
+    """Drone inimigo: esfera com um olho e espinhos."""
+    h = max(4, int(h))
+    s = Spr(h, h)
+    espinho = [(90, 30, 40), (150, 50, 60), (200, 90, 90)]
+    s.poligono([(h * 0.2, h * 0.4), (h * 0.0, h * 0.5), (h * 0.2, h * 0.6)], espinho)
+    s.poligono([(h * 0.8, h * 0.4), (h * 1.0, h * 0.5), (h * 0.8, h * 0.6)], espinho)
+    s.poligono([(h * 0.4, h * 0.2), (h * 0.5, h * 0.0), (h * 0.6, h * 0.2)], espinho)
+    s.elipse(h * 0.5, h * 0.5, h * 0.34, h * 0.34, [(110, 20, 30), (180, 40, 50), (230, 80, 80), (255, 150, 140)])
+    s.contorno((30, 8, 12))
+    s.elipse(h * 0.42, h * 0.48, h * 0.12, h * 0.12, cor=(250, 245, 220))
+    s.elipse(h * 0.4, h * 0.48, h * 0.05, h * 0.06, cor=(20, 10, 10))
+    return s
+
+
+@functools.lru_cache(maxsize=8)
+def colosso(h):
+    """Silhueta do chefe gigante."""
+    h = max(8, int(h))
+    w = int(h * 1.1)
+    s = Spr(w, h)
+    pele = [(20, 10, 34), (36, 20, 58), (56, 32, 84), (80, 50, 112)]
+    s.poligono([(w * 0.3, h * 0.25), (w * 0.12, h * 0.0), (w * 0.38, h * 0.18)], pele)
+    s.poligono([(w * 0.7, h * 0.25), (w * 0.88, h * 0.0), (w * 0.62, h * 0.18)], pele)
+    s.elipse(w * 0.5, h * 0.48, w * 0.42, h * 0.34, pele)
+    s.poligono([(w * 0.18, h * 0.62), (w * 0.82, h * 0.62), (w * 0.66, h * 0.98), (w * 0.34, h * 0.98)], pele)
+    s.contorno((8, 4, 14))
+    for k in range(5):
+        x = w * (0.34 + k * 0.08)
+        s.poligono([(x, h * 0.7), (x + w * 0.04, h * 0.84), (x + w * 0.08, h * 0.7)], [(200, 190, 170), (235, 228, 210)])
+    return s
+
+
+@functools.lru_cache(maxsize=4)
+def nebulosa(W, H):
+    campo = []
+    for y in range(H):
+        linha = []
+        for x in range(W * 2):
+            n = fbm(x * 0.045, y * 0.09, 3)
+            m = ruido(x * 0.02 + 40, y * 0.04)
+            a = max(0.0, (n - 0.42) * 1.6)
+            linha.append((lerp_cor((150, 40, 170), (40, 150, 190), m), min(0.75, a)))
+        campo.append(linha)
+    return campo
+
+
+def espaco(tela, t, vel):
+    tela.ceu([(0, (2, 2, 12)), (1, (12, 6, 34))])
+    neb = nebulosa(tela.W, tela.H)
+    off = int(t * vel * 0.15)
+    larg = tela.W * 2
+    for y in range(tela.H):
+        linha = neb[y]
+        for x in range(tela.W):
+            c, a = linha[(x + off) % larg]
+            if a > 0.02:
+                tela.misturar(x, y, c, a)
+    estrelas(tela, t, vel=vel)
+
+
+def planeta(tela, cx, cy, r):
+    tela.brilho(cx, cy, r * 1.4, (90, 200, 255), 0.35)
+    ramp = [(14, 40, 60), (24, 80, 110), (40, 130, 160), (90, 190, 210), (170, 235, 245)]
+    for y in range(int(cy - r), int(cy + r) + 1):
+        for x in range(int(cx - r), int(cx + r) + 1):
+            nx, ny = (x + 0.5 - cx) / r, (y + 0.5 - cy) / r
+            r2 = nx * nx + ny * ny
+            if r2 > 1:
+                continue
+            nz = math.sqrt(1 - r2)
+            d = max(0.0, min(0.999, nx * LUZ[0] + ny * LUZ[1] + nz * LUZ[2]))
+            faixa = 0.12 * math.sin(ny * 14 + ruido(x * 0.1, y * 0.3) * 3)
+            tela.ponto(x, y, ramp[max(0, min(4, int((d + faixa) * 5)))])
+    for k in range(int(r * 7)):
+        a = k / (r * 7) * 2 * math.pi
+        x, y = cx + math.cos(a) * r * 1.7, cy + math.sin(a) * r * 0.35
+        if math.sin(a) > 0 or (x - cx) ** 2 / r ** 2 + (y - cy) ** 2 / r ** 2 > 1:
+            tela.ponto(x, y, (240, 180, 110) if k % 3 else (200, 130, 80))
+
+
+def explosao(tela, x, y, q, tam):
+    if not 0 <= q < 1:
+        return
+    tela.brilho(x, y, tam * (0.6 + q), (255, 220, 140), 1 - q)
+    for k in range(10):
+        ang = k * 2 * math.pi / 10 + _hash(k, int(x)) * 0.5
+        d = q * tam * (1 + _hash(k, 5))
+        tela.brilho(x + math.cos(ang) * d, y + math.sin(ang) * d, max(1.2, tam * 0.2),
+                    (255, 140, 40) if k % 2 else (255, 255, 200), 1 - q)
+
+
+def astro(tela, t):
+    W, H = tela.W, tela.H
+    hn = int(min(H * 0.22, W * 0.1))
+    if t < 3.0:
+        espaco(tela, t, 6)
+        planeta(tela, W * 0.72, H * 0.62, max(3, H * 0.28))
+        if 0.6 <= t <= 2.8:
+            a = min(1, (t - 0.6) / 0.4, (2.8 - t) / 0.4)
+            tela.texto(tela.rows // 4, "ANO 2189 - SETOR VÉRTICE", lerp_cor((8, 4, 24), (190, 230, 255), a))
+        return
+    if t < 11.0:
+        espaco(tela, t, 14)
+        planeta(tela, W * 0.72 - (t - 3) * 2, H * 0.62, max(3, H * 0.28))
+        tremor = (_hash(int(t * 30), 1) - 0.5) * hn * 0.4 if t >= 10.0 else 0
+        nx = lerp(-hn * 2, W * 0.12, ease((t - 3.0) / 1.2))
+        ny = H * 0.45 + math.sin(t * 2.2) * H * 0.12
+        for k in range(1, 7):
+            tela.brilho(nx - k * hn * 0.35, ny + hn * 0.5, hn * 0.3 * (1 - k / 7), (255, 160, 60), 0.6)
+        tela.brilho(nx, ny + hn * 0.5, hn * (0.35 + 0.08 * math.sin(t * 30)), (120, 200, 255), 0.9)
+        tela.desenhar(nave(hn), nx + tremor, ny - tremor)
+        hd = max(5, int(hn * 1.1))
+        for k in range(6):
+            ts = 4.0 + k * 0.55
+            th = ts + 1.6
+            if t < ts or t >= th + 0.8:
+                continue
+            ex = W + hd - (t - ts) * W * 0.32
+            ey = H * 0.48 + math.sin((t - ts) * 2.5 + k) * H * 0.26
+            if t < th:
+                tela.desenhar(drone(hd), ex - hd / 2, ey - hd / 2)
+            else:
+                ex2 = W + hd - (th - ts) * W * 0.32
+                ey2 = H * 0.48 + math.sin((th - ts) * 2.5 + k) * H * 0.26
+                explosao(tela, ex2, ey2, (t - th) / 0.8, hd)
+        if 4.4 <= t < 9.6:
+            for k in range(16):
+                tf = 4.4 + k * 0.32
+                if tf > t:
+                    break
+                bx = nx + hn * 1.8 + (t - tf) * W * 1.1
+                by = H * 0.45 + math.sin(tf * 2.2) * H * 0.12 + hn * 0.52
+                if bx < W:
+                    tela.retangulo(bx, by, bx + max(2, hn * 0.5), by + 1, (255, 250, 150))
+                    tela.brilho(bx + hn * 0.25, by, hn * 0.25, (255, 230, 80), 0.4)
+        if 6.0 <= t < 8.5:
+            ax = lerp(W + H * 0.3, -H * 0.4, (t - 6.0) / 2.5)
+            ar = H * 0.22
+            ramp = [(30, 26, 26), (60, 52, 48), (95, 84, 76), (140, 126, 112)]
+            for y in range(int(H * 0.8 - ar), int(H * 0.8 + ar) + 1):
+                for x in range(int(ax - ar), int(ax + ar) + 1):
+                    nx2, ny2 = (x + 0.5 - ax) / ar, (y + 0.5 - H * 0.8) / ar
+                    r2 = nx2 * nx2 + ny2 * ny2
+                    borda = 0.75 + 0.25 * ruido(math.atan2(ny2, nx2) * 3 + 10, 2)
+                    if r2 <= borda * borda:
+                        d = nx2 * LUZ[0] + ny2 * LUZ[1] + math.sqrt(max(0, 1 - r2)) * LUZ[2]
+                        d += (ruido(x * 0.3, y * 0.3) - 0.5) * 0.4
+                        tela.ponto(x, y, ramp[max(0, min(3, int(d * 4)))])
+        if t >= 8.8:
+            hb = int(H * 0.85)
+            bx = lerp(W + 2, W - hb * 0.95, ease((t - 9.2) / 1.2)) + tremor
+            by = H * 0.08
+            spr = colosso(hb)
+            tela.desenhar(spr, bx, by)
+            for fx in (0.36, 0.6):
+                ox, oy = bx + spr.w * fx, by + hb * 0.42
+                tela.brilho(ox, oy, hb * 0.12, (255, 40, 40), 0.9)
+                tela.circulo(ox, oy, max(0.8, hb * 0.03), (255, 230, 200))
+            if t < 10.4 and int(t * 4) % 2 == 0:
+                tela.texto(1, "!! ALERTA !!", (255, 60, 60))
+        if t >= 10.4:
+            tela.flash((t - 10.4) / 0.6)
+        return
+
+    espaco(tela, t, 3)
+    planeta(tela, W * 0.8, H * 0.78, max(3, H * 0.3))
+    if t < 11.4:
+        tela.flash(1 - (t - 11.0) / 0.4)
+    fim = titulo(tela, ["ASTRO", "VERTICE"], t, 11.2,
+                 [(220, 255, 255), (80, 220, 255), (40, 100, 220), (140, 60, 200)],
+                 contorno=(6, 8, 30), sombra=(30, 10, 60), entrada="revelar")
+    if 12.2 <= t < 14.0:
+        q = (t - 12.2) / 1.8
+        nx, ny = lerp(-hn * 2, W + hn, q), lerp(H * 0.9, fim + (H - fim) * 0.3, q)
+        for k in range(1, 10):
+            tela.brilho(nx - k * hn * 0.5, ny + hn * 0.5 + k * 0.6, hn * 0.3 * (1 - k / 10), (120, 200, 255), 0.5)
+        tela.desenhar(nave(hn), nx, ny)
+    rodape(tela, t, 13.0, "MISSÃO ÓRBITA ZERO", fim // 2 + 1, 13.8)
+
+# ======================================================================== REINO DE CINZA
+@functools.lru_cache(maxsize=32)
+def cavaleiro(h, fase=0, alta=False):
+    """Cavaleiro de capa vermelha, visto de lado."""
+    h = max(8, int(h))
+    w = max(5, int(h * 0.8))
+    s = Spr(w, h)
+    ond = [0, 0.04, 0.08, 0.04][fase % 4] * w
+    capa = [(100, 16, 26), (150, 28, 38), (200, 52, 58)]
+    s.poligono([(w * 0.4, h * 0.24), (w * 0.18 - ond, h * 0.4), (w * 0.04 - ond * 1.6, h * 0.92 + ond * 0.3),
+                (w * 0.3 - ond, h * 0.86), (w * 0.42, h * 0.7)], capa)
+    aco = [(70, 75, 90), (120, 128, 145), (175, 182, 198), (225, 230, 240)]
+    s.ret(w * 0.4, h * 0.66, w * 0.49, h * 0.99, (55, 58, 70))
+    s.ret(w * 0.53, h * 0.66, w * 0.62, h * 0.99, (80, 85, 100))
+    s.poligono([(w * 0.37, h * 0.27), (w * 0.67, h * 0.27), (w * 0.64, h * 0.68), (w * 0.39, h * 0.68)], aco)
+    s.elipse(w * 0.53, h * 0.17, w * 0.13, h * 0.11, aco)
+    s.poligono([(w * 0.5, h * 0.07), (w * 0.4, h * 0.0), (w * 0.28, h * 0.08), (w * 0.46, h * 0.1)], capa)
+    s.contorno((14, 12, 20))
+    for x in range(int(w * 0.56), int(w * 0.66) + 1):
+        s.px[(x, int(h * 0.17))] = (14, 12, 20)
+    if alta:
+        mao, ponta = (w * 0.72, h * 0.3), (w * 0.86, -h * 0.4)
+    else:
+        mao, ponta = (w * 0.72, h * 0.52), (w * 1.1, h * 0.98)
+    s.linha(w * 0.6, h * 0.34, mao[0], mao[1], (150, 156, 172), max(1, int(h * 0.04)))
+    s.linha(mao[0], mao[1], ponta[0], ponta[1], (225, 232, 245), max(1, int(h * 0.03)))
+    dx, dy = ponta[0] - mao[0], ponta[1] - mao[1]
+    n = math.hypot(dx, dy) or 1
+    px_, py_ = -dy / n * h * 0.06, dx / n * h * 0.06
+    s.linha(mao[0] - px_, mao[1] - py_, mao[0] + px_, mao[1] + py_, (220, 170, 60))
+    s.ponta = ponta
+    return s
+
+
+@functools.lru_cache(maxsize=8)
+def dragao(h, asa=0):
+    """Silhueta de dragão voando para a esquerda."""
+    h = max(6, int(h))
+    w = int(h * 1.6)
+    s = Spr(w, h)
+    esc = [(22, 10, 28), (40, 20, 46), (62, 32, 64)]
+    if asa:
+        s.poligono([(w * 0.42, h * 0.55), (w * 0.6, h * 0.98), (w * 0.82, h * 0.86), (w * 0.62, h * 0.58)], esc)
+    else:
+        s.poligono([(w * 0.42, h * 0.48), (w * 0.56, h * 0.0), (w * 0.86, h * 0.12), (w * 0.62, h * 0.5)], esc)
+    s.poligono([(w * 0.68, h * 0.5), (w * 0.99, h * 0.64), (w * 0.94, h * 0.68), (w * 0.66, h * 0.62)], esc)
+    s.poligono([(w * 0.34, h * 0.5), (w * 0.15, h * 0.37), (w * 0.12, h * 0.45), (w * 0.33, h * 0.62)], esc)
+    s.elipse(w * 0.5, h * 0.55, w * 0.2, h * 0.13, esc)
+    s.elipse(w * 0.1, h * 0.4, w * 0.07, h * 0.065, esc)
+    s.poligono([(w * 0.12, h * 0.36), (w * 0.2, h * 0.24), (w * 0.17, h * 0.38)], esc)
+    s.contorno((8, 4, 10))
+    s.px[(int(w * 0.07), int(h * 0.39))] = (255, 130, 40)
+    return s
+
+
+def castelo(tela, cx, base, u, cor, t):
+    janela = (255, 190, 90)
+    tela.retangulo(cx - 3.6 * u, base - 4.5 * u, cx + 3.6 * u, base + 1, cor)
+    for k in range(-7, 8, 2):
+        tela.retangulo(cx + k * u * 0.5 - u * 0.2, base - 5.1 * u, cx + k * u * 0.5 + u * 0.2, base - 4.5 * u, cor)
+    for pos, alt, larg in ((-3.0, 7, 1.6), (-1.5, 9.5, 1.5), (0.0, 12, 2.0), (1.5, 9, 1.5), (3.0, 6.5, 1.6)):
+        x0, x1 = cx + pos * u - larg * u / 2, cx + pos * u + larg * u / 2
+        tela.retangulo(x0, base - alt * u, x1, base + 1, cor)
+        tela.poligono([(x0 - u * 0.2, base - alt * u), (x1 + u * 0.2, base - alt * u),
+                       ((x0 + x1) / 2, base - alt * u - larg * u * 1.4)], cor)
+        for k in range(3):
+            wy = base - alt * u * (0.35 + k * 0.2)
+            if _hash(int(pos * 10) + k, int(t * 2)) > 0.35:
+                tela.retangulo((x0 + x1) / 2 - max(0.5, u * 0.2), wy, (x0 + x1) / 2 + max(0.5, u * 0.2), wy + max(1, u * 0.5), janela)
+
+
+def fogo(tela, base, altura, t, larg_x0=0, larg_x1=None):
+    larg_x1 = tela.W if larg_x1 is None else larg_x1
+    for x in range(int(larg_x0), int(larg_x1)):
+        hh = altura * (0.35 + 0.65 * fbm(x * 0.12, t * 2.5, 2))
+        for y in range(int(base - hh), int(base) + 1):
+            f = (base - y) / max(1, hh)
+            c = cor_em([(0, (255, 245, 190)), (0.3, (255, 190, 60)), (0.65, (230, 80, 30)), (1, (120, 20, 20))], f)
+            tela.misturar(x, y, c, 1 - f ** 2.5)
+
+
+def brasas(tela, t, n=18, y_base=None):
+    y_base = tela.H if y_base is None else y_base
+    for k in range(n):
+        fase = (t * (0.25 + 0.2 * _hash(k, 1)) + _hash(k, 2)) % 1
+        x = _hash(k, 3) * tela.W + math.sin(t * 2 + k) * 3
+        y = lerp(y_base, 0, fase)
+        tela.brilho(x, y, 1.5, (255, 150 + int(80 * _hash(k, 4)), 60), 1 - fase)
+
+
+def reino(tela, t):
+    W, H = tela.W, tela.H
+    u = max(1.2, min(W * 0.03, H * 0.045))
+    if t < 4.0:
+        raio = (0.8 <= t < 1.1) or (2.4 <= t < 2.8)
+        tela.ceu([(0, (6, 6, 14)), (1, (26, 24, 44))])
+        silh = (40, 38, 62) if raio else (14, 12, 24)
+        castelo(tela, W * 0.62, H * 0.66, u, silh, t)
+        tela.poligono([(0, H * 0.62), (W * 0.35, H * 0.58), (W * 0.5, H * 0.66), (W * 0.9, H * 0.64),
+                       (W, H * 0.7), (W, H), (0, H)], (10, 8, 16) if not raio else (30, 28, 44))
+        if raio and int(t * 20) % 2 == 0:
+            tela.flash(0.45, (220, 225, 255))
+            x, y = W * (0.8 if t < 2 else 0.4), 0.0
+            while y < H * 0.45:
+                nx, ny = x + (_hash(int(y), int(t)) - 0.5) * u * 4, y + u * 1.5
+                tela.linha(x, y, nx, ny, (255, 255, 255))
+                tela.linha(x + 1, y, nx + 1, ny, (200, 210, 255), 0.6)
+                x, y = nx, ny
+        for k in range(70):
+            x = (_hash(k, 1) * W + t * W * 0.35) % W
+            y = (_hash(k, 2) * H + t * H * 1.8) % H
+            tela.linha(x, y, x - 1, y + 2, (150, 170, 210), 0.5)
+        if 1.4 <= t <= 3.8:
+            a = min(1, (t - 1.4) / 0.4, (3.8 - t) / 0.4)
+            tela.texto(tela.rows // 5, "Há muito tempo, a chama azul se apagou...", lerp_cor((10, 10, 20), (210, 215, 235), a))
+        return
+    if t < 10.0:
+        tela.ceu([(0, (20, 8, 30)), (0.55, (120, 30, 40)), (1, (230, 110, 50))])
+        lx, ly, lr = W * 0.55, H * 0.3, max(3, H * 0.2)
+        tela.brilho(lx, ly, lr * 2.2, (255, 200, 160), 0.4)
+        tela.circulo(lx, ly, lr, (250, 225, 190))
+        tela.circulo(lx + lr * 0.3, ly - lr * 0.25, lr * 0.2, (230, 200, 165))
+        if 4.5 <= t < 7.8:
+            q = (t - 4.5) / 3.3
+            hd = int(min(H * 0.36, W * 0.2))
+            tela.desenhar(dragao(hd, int(t * 5) % 2), lerp(W * 1.05, -hd * 1.8, q), H * 0.12 + math.sin(t * 3) * H * 0.04)
+        castelo(tela, W * 0.72, H * 0.68, u * 0.8, (40, 14, 26), t)
+        penhasco = [(0, H * 0.7), (W * 0.32, H * 0.66), (W * 0.42, H * 0.74), (W * 0.42, H), (0, H)]
+        tela.poligono([(W * 0.4, H * 0.8), (W * 0.7, H * 0.76), (W, H * 0.8), (W, H), (W * 0.4, H)], (30, 12, 20))
+        tela.poligono(penhasco, (16, 8, 14))
+        hh = int(min(H * 0.48, W * 0.3))
+        alta = t >= 7.8
+        sp = cavaleiro(hh, int(t * 6) % 4, alta)
+        cx, cy = W * 0.14, H * 0.67 - hh + 1
+        tela.desenhar(sp, cx, cy)
+        if 7.9 <= t < 9.0:
+            gx, gy = cx + sp.ponta[0], cy + sp.ponta[1]
+            q = (t - 7.9) / 1.1
+            tam = hh * 0.35 * math.sin(q * math.pi)
+            tela.brilho(gx, gy, tam * 1.5, (180, 220, 255), 0.9)
+            tela.linha(gx - tam, gy, gx + tam, gy, (255, 255, 255))
+            tela.linha(gx, gy - tam, gx, gy + tam, (255, 255, 255))
+        brasas(tela, t)
+        if t >= 9.4:
+            tela.flash((t - 9.4) / 0.6, (0, 0, 0))
+        return
+
+    tela.ceu([(0, (4, 2, 8)), (1, (40, 10, 14))])
+    estrelas(tela, t, 0.5)
+    castelo(tela, W * 0.5, H * 0.9, u * 0.9, (24, 8, 14), t)
+    fogo(tela, H, H * 0.28, t)
+    brasas(tela, t, 26)
+    if t < 10.4:
+        tela.flash(1 - (t - 10.0) / 0.4, (0, 0, 0))
+    fim = titulo(tela, ["REINO", "DE CINZA"], t, 10.2,
+                 [(255, 250, 220), (255, 210, 110), (200, 120, 50), (120, 60, 40)],
+                 contorno=(20, 6, 6), sombra=(60, 10, 10), entrada="cair")
+    rodape(tela, t, 12.0, "A LENDA DA CHAMA AZUL", fim // 2 + 1, 12.8)
+
+# ======================================================================== registro
+ABERTURAS = {
+    "elementra": ("Elementra", "monstros e batalhas", 20.0, elementra),
+    "turbo": ("Turbo Asfalto", "corrida com pista em pseudo-3D", 16.0, turbo),
+    "astro": ("Astro Vértice", "nave espacial e chefe gigante", 16.0, astro),
+    "reino": ("Reino de Cinza", "fantasia com castelo e dragão", 16.0, reino),
+}
+ORDEM_ESTILOS = ["gb", "gbc", "gba"]
+
+
+def quadro(nome, estilo, t, tamanho=None):
+    tela = Tela(estilo, tamanho)
+    ABERTURAS[nome][3](tela, t)
+    return tela
+
+
+# ======================================================================== execução
+class Teclado:
+    """Lê teclas sem bloquear (q, espaço, setas, e)."""
+
+    def __enter__(self):
+        self.fd = None
+        if termios and sys.stdin.isatty():
+            self.fd = sys.stdin.fileno()
+            self.antigo = termios.tcgetattr(self.fd)
+            tty.setcbreak(self.fd)
+        return self
+
+    def __exit__(self, *_):
+        if self.fd is not None:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.antigo)
+
+    def ler(self):
+        if self.fd is None:
+            return None
+        pronto, _, _ = select.select([sys.stdin], [], [], 0)
+        return os.read(self.fd, 16).decode(errors="ignore") if pronto else None
+
+
+def tocar(nome, estado, teclado):
+    """Toca uma abertura. Devolve 'fim', 'proxima' ou 'sair'."""
+    t0, duracao = time.time(), ABERTURAS[nome][2]
+    while True:
+        inicio = time.time()
+        t = inicio - t0
+        if t > duracao:
+            return "fim"
+        tecla = teclado.ler()
+        if tecla:
+            if tecla[0] in "qQ" or tecla == "\x1b":
+                return "sair"
+            if tecla[0] == " " or tecla in ("\x1b[C", "\n", "\r"):
+                return "proxima"
+            if tecla[0] in "eE":
+                i = ORDEM_ESTILOS.index(estado["estilo"])
+                estado["estilo"] = ORDEM_ESTILOS[(i + 1) % len(ORDEM_ESTILOS)]
+        sys.stdout.write(quadro(nome, estado["estilo"], t).render())
+        sys.stdout.flush()
+        time.sleep(max(0.0, 1 / FPS - (time.time() - inicio)))
+
+
+def fila(abertura):
+    """Gera as aberturas a tocar: a escolhida em loop, ou sorteadas sem repetir seguidas."""
+    anterior = None
+    while True:
+        if abertura in ABERTURAS:
+            yield abertura
+            continue
+        opcoes = [a for a in ABERTURAS if a != anterior]
+        anterior = random.choice(opcoes)
+        yield anterior
+
+
+def executar(abertura, estilo, uma_vez):
+    estado = {"estilo": random.choice(ORDEM_ESTILOS) if estilo == "aleatorio" else estilo}
+
+    def restaurar(*_):
+        sys.stdout.write("\x1b[0m\x1b[?25h\x1b[2J\x1b[?1049l")
+        sys.stdout.flush()
+
+    def ao_encerrar(*_):
+        restaurar()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, ao_encerrar)
+    sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[2J")
+    try:
+        with Teclado() as teclado:
+            for nome in fila(abertura):
+                if tocar(nome, estado, teclado) == "sair" or uma_vez:
+                    break
+                if estilo == "aleatorio":
+                    estado["estilo"] = random.choice(ORDEM_ESTILOS)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        restaurar()
+
+
+def listar():
+    print("Aberturas:")
+    for k, (nome, desc, *_ ) in ABERTURAS.items():
+        print(f"  {k:<10} {nome}: {desc}")
+    print("  aleatoria  sorteia uma diferente a cada vez (padrão)")
+    print("\nEstilos (-e):")
+    for k, v in ESTILOS.items():
+        print(f"  {k:<10} {v}{'  (padrão)' if k == 'gba' else ''}")
+    print("  aleatorio  sorteia a cada abertura")
+
+
+def main():
+    import argparse
+
+    p = argparse.ArgumentParser(
+        prog="termboy",
+        description="Aberturas animadas de jogos retrô no terminal, no estilo Game Boy / GBA.",
+        epilog="Teclas: q sai | espaço ou → pula para a próxima | e troca o estilo",
+    )
+    p.add_argument("abertura", nargs="?", default="aleatoria", choices=list(ABERTURAS) + ["aleatoria"],
+                   help="qual abertura tocar (padrão: aleatoria)")
+    p.add_argument("-e", "--estilo", default="gba", choices=list(ESTILOS) + ["aleatorio"],
+                   help="estilo de cor (padrão: gba)")
+    p.add_argument("-u", "--uma-vez", action="store_true", help="toca uma abertura e sai")
+    p.add_argument("-l", "--lista", action="store_true", help="lista aberturas e estilos")
+    args = p.parse_args()
+    if args.lista:
+        listar()
+        return
+    executar(args.abertura, args.estilo, args.uma_vez)
+
+
+if __name__ == "__main__":
+    main()
