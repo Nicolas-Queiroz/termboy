@@ -7,14 +7,17 @@ Todas as aberturas, personagens, nomes e cenários são originais.
   termboy turbo            toca só uma abertura, em loop
   termboy -e gb            escolhe o estilo de cor (gb, gbc, gba, aleatorio)
   termboy -u               toca uma vez e sai
-  termboy -l               lista as aberturas e estilos
+  termboy -l               lista as aberturas, jogos e estilos
+  termboy jogar [nome]     modo jogo (gato, tocha, turbo, astro)
 
 Teclas: q sai | espaço ou → pula para a próxima | e troca o estilo
 """
 import functools
+import json
 import math
 import os
 import random
+import re
 import select
 import shutil
 import signal
@@ -27,7 +30,7 @@ try:
 except ImportError:  # Windows sem WSL
     termios = tty = None
 
-FPS = 15
+FPS = 24
 ESTILOS = {"gb": "Game Boy", "gbc": "Game Boy Color", "gba": "Game Boy Advance"}
 
 GB = [(15, 56, 15), (48, 98, 48), (139, 172, 15), (155, 188, 15)]
@@ -35,16 +38,16 @@ BAYER = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]]
 
 
 # ======================================================================== cores
+@functools.lru_cache(maxsize=1 << 16)
 def conv(c, estilo):
     r, g, b = c
     if estilo == "gb":
         lum = 0.299 * r + 0.587 * g + 0.114 * b
         return GB[min(3, int(lum / 64))]
     if estilo == "gbc":
-        q = lambda v: min(255, round(v / 85) * 85)
-        return (q(r), q(g), q(b))
-    q = lambda v: min(255, (int(v) >> 3) << 3)  # GBA: 15 bits de cor
-    return (q(r), q(g), q(b))
+        return (min(255, round(r / 85) * 85), min(255, round(g / 85) * 85), min(255, round(b / 85) * 85))
+    # GBA: 15 bits de cor
+    return (min(255, (int(r) >> 3) << 3), min(255, (int(g) >> 3) << 3), min(255, (int(b) >> 3) << 3))
 
 
 def lerp(a, b, p):
@@ -53,7 +56,7 @@ def lerp(a, b, p):
 
 def lerp_cor(c1, c2, p):
     p = max(0.0, min(1.0, p))
-    return tuple(int(lerp(x, y, p)) for x, y in zip(c1, c2))
+    return (int(c1[0] + (c2[0] - c1[0]) * p), int(c1[1] + (c2[1] - c1[1]) * p), int(c1[2] + (c2[2] - c1[2]) * p))
 
 
 def clarear(c, f):
@@ -195,12 +198,30 @@ FONTE = {
     "6": ".###.#....####.#...#.###.", "7": "#####....#...#...#....#..",
     "8": ".###.#...#.###.#...#.###.", "9": ".###.#...#.####....#.###.",
     "!": "..#....#....#.........#..", "-": "..........###..........",
+    ":": "......#.........#........", ".": "......................#..",
+    "+": ".......#...###...#.......", "/": "....#...#...#...#...#....",
+    "?": ".###.#...#..##.......#...",
     " ": "." * 25,
 }
 FONTE = {k: [v.ljust(25, ".")[i * 5:i * 5 + 5] for i in range(5)] for k, v in FONTE.items()}
 
 
 # ======================================================================== tela
+@functools.lru_cache(maxsize=24)
+def _linhas_ceu(stops, bandas, y0, y1, W, estilo):
+    """Linhas de pixels do degradê com pontilhado Bayer; o céu quase nunca muda entre quadros."""
+    linhas = []
+    for y in range(y0, y1):
+        p = (y - y0) / max(1, y1 - y0 - 1) * bandas
+        i = int(p)
+        f = p - i
+        c0 = conv(cor_em(stops, i / bandas), estilo)
+        c1 = conv(cor_em(stops, min(bandas, i + 1) / bandas), estilo)
+        b = BAYER[y % 4]
+        linhas.append([c1 if b[x % 4] / 16 < f else c0 for x in range(W)])
+    return linhas
+
+
 class Tela:
     """Canvas de pixels; cada caractere do terminal mostra 2 pixels (meio bloco)."""
 
@@ -216,15 +237,9 @@ class Tela:
 
     def ceu(self, stops, bandas=12, y0=0, y1=None):
         y1 = self.H if y1 is None else y1
+        linhas = _linhas_ceu(tuple(stops), bandas, y0, y1, self.W, self.estilo)
         for y in range(max(0, y0), min(self.H, y1)):
-            p = (y - y0) / max(1, y1 - y0 - 1) * bandas
-            i = int(p)
-            f = p - i
-            c0 = self.c(cor_em(stops, i / bandas))
-            c1 = self.c(cor_em(stops, min(bandas, i + 1) / bandas))
-            linha, b = self.px[y], BAYER[y % 4]
-            for x in range(self.W):
-                linha[x] = c1 if b[x % 4] / 16 < f else c0
+            self.px[y] = linhas[y - y0][:]
 
     def ponto(self, x, y, c):
         x, y = int(x), int(y)
@@ -234,15 +249,21 @@ class Tela:
     def misturar(self, x, y, c, a):
         x, y = int(x), int(y)
         if a > 0 and 0 <= x < self.W and 0 <= y < self.H:
-            self.px[y][x] = self.c(lerp_cor(self.px[y][x], c, a))
+            linha = self.px[y]
+            linha[x] = conv(lerp_cor(linha[x], c, a), self.estilo)
 
     def brilho(self, cx, cy, r, cor, forca):
         r = max(r, 0.5)
-        for y in range(int(cy - r), int(cy + r) + 1):
-            for x in range(int(cx - r), int(cx + r) + 1):
-                d = math.hypot(x - cx, y - cy) / r
+        if forca <= 0:
+            return
+        estilo, hypot = self.estilo, math.hypot
+        x0, x1 = max(0, int(cx - r)), min(self.W, int(cx + r) + 1)
+        for y in range(max(0, int(cy - r)), min(self.H, int(cy + r) + 1)):
+            linha, dy = self.px[y], y - cy
+            for x in range(x0, x1):
+                d = hypot(x - cx, dy) / r
                 if d < 1:
-                    self.misturar(x, y, cor, forca * (1 - d) ** 2)
+                    linha[x] = conv(lerp_cor(linha[x], cor, forca * (1 - d) ** 2), estilo)
 
     def circulo(self, cx, cy, r, cor):
         for y in range(int(cy - r) - 1, int(cy + r) + 2):
@@ -289,9 +310,13 @@ class Tela:
             for y in range(self.H):
                 self.px[y] = [c] * self.W
             return
-        for y in range(self.H):
-            for x in range(self.W):
-                self.misturar(x, y, cor, a)
+        memo = {}
+        for linha in self.px:
+            for x, c in enumerate(linha):
+                n = memo.get(c)
+                if n is None:
+                    n = memo[c] = self.c(lerp_cor(c, cor, a))
+                linha[x] = n
 
     def letra(self, ch, x, y, s, cor, inclinacao=0.0):
         glifo = FONTE.get(ch, FONTE[" "])
@@ -305,34 +330,103 @@ class Tela:
                         X, Y = int(x) + i * s + dx + desvio, int(y) + j * s + dy
                         self.ponto(X, Y, cor(X, Y, (j * s + dy) / (5 * s)) if callable(cor) else cor)
 
-    def texto(self, linha, s, cor):
-        self.textos.append((int(linha), s, cor))
+    def texto(self, linha, s, cor, coluna=None):
+        """Texto do terminal por cima dos pixels. coluna: None centraliza, >= 0 alinha
+        à esquerda nessa coluna, < 0 alinha à direita (-1 encosta na borda)."""
+        self.textos.append((int(linha), s, cor, coluna))
 
-    def render(self):
-        txt = {}
-        for row, s, cor in self.textos:
-            if 0 <= row < self.rows:
-                s = s[: self.cols]
-                c0 = (self.cols - len(s)) // 2
-                for i, ch in enumerate(s):
-                    txt[(row, c0 + i)] = (ch, self.c(cor))
-        out = []
+    def celulas(self):
+        """O quadro como grade de células (caractere, cor de frente, cor de fundo)."""
+        grade = []
         for row in range(self.rows):
-            out.append(f"\x1b[{row + 1};1H")
-            ant = None
-            topo, base = self.px[2 * row], self.px[2 * row + 1]
-            for x in range(self.cols):
-                if (row, x) in txt:
-                    ch, fg = txt[(row, x)]
-                    bg = topo[x]
-                else:
-                    ch, fg, bg = "▀", topo[x], base[x]
-                if (fg, bg) != ant:
+            topo = self.px[2 * row]
+            grade.append([("▀", a, b) for a, b in zip(topo, self.px[2 * row + 1])])
+        for row, s, cor, coluna in self.textos:
+            if not 0 <= row < self.rows:
+                continue
+            s = s[: self.cols]
+            if coluna is None:
+                c0 = (self.cols - len(s)) // 2
+            elif coluna < 0:
+                c0 = self.cols - len(s) + coluna + 1
+            else:
+                c0 = coluna
+            linha, topo, fg = grade[row], self.px[2 * row], self.c(cor)
+            for i, ch in enumerate(s):
+                if 0 <= c0 + i < self.cols:
+                    linha[c0 + i] = (ch, fg, topo[c0 + i])
+        return grade
+
+    def render(self, anterior=None):
+        """Sequência ANSI do quadro inteiro, ou só do que mudou em relação a `anterior`."""
+        return emitir(self.celulas(), anterior)
+
+
+def emitir(grade, anterior=None, folga=3):
+    """Converte a grade em ANSI. Com `anterior`, emite só as sequências de células que
+    mudaram (buracos de até `folga` células iguais entram na sequência, porque reposicionar
+    o cursor custa mais que reescrevê-las) e só troca a cor quando ela muda."""
+    out, cor = [], None
+    for row, linha in enumerate(grade):
+        n = len(linha)
+        velha = anterior[row] if anterior is not None and row < len(anterior) else None
+        if velha is None or len(velha) != n:
+            trechos = [(0, n)]
+        else:
+            trechos, x = [], 0
+            while x < n:
+                if linha[x] == velha[x]:
+                    x += 1
+                    continue
+                ini = fim = x
+                while x < n:
+                    if linha[x] != velha[x]:
+                        fim = x = x + 1
+                    elif x - fim < folga:
+                        x += 1
+                    else:
+                        break
+                trechos.append((ini, fim))
+        for ini, fim in trechos:
+            out.append(f"\x1b[{row + 1};{ini + 1}H")
+            for ch, fg, bg in linha[ini:fim]:
+                if (fg, bg) != cor:
                     out.append("\x1b[38;2;%d;%d;%dm\x1b[48;2;%d;%d;%dm" % (fg + bg))
-                    ant = (fg, bg)
+                    cor = (fg, bg)
                 out.append(ch)
+    if out:
         out.append("\x1b[0m")
-        return "".join(out)
+    return "".join(out)
+
+
+class Saida:
+    """Dona do terminal: lembra o último quadro e escreve só a diferença.
+
+    Redesenha tudo na primeira vez, quando o tamanho muda ou depois de `forcar()`
+    (chamado pelo handler de SIGWINCH através de uma flag)."""
+
+    def __init__(self, escrever=None):
+        self.escrever = escrever or _escrever_stdout
+        self.anterior = None
+
+    def forcar(self):
+        self.anterior = None
+
+    def mostrar(self, tela):
+        grade = tela.celulas()
+        ant = self.anterior
+        if ant is None or len(ant) != len(grade) or len(ant[0]) != len(grade[0]):
+            saida = "\x1b[0m\x1b[2J" + emitir(grade)
+        else:
+            saida = emitir(grade, ant)
+        self.anterior = grade
+        if saida:
+            self.escrever(saida)
+
+
+def _escrever_stdout(s):
+    sys.stdout.write(s)
+    sys.stdout.flush()
 
 
 # ======================================================================== título
@@ -916,12 +1010,13 @@ def espaco(tela, t, vel):
     neb = nebulosa(tela.W, tela.H)
     off = int(t * vel * 0.15)
     larg = tela.W * 2
+    estilo = tela.estilo
     for y in range(tela.H):
-        linha = neb[y]
+        linha, px = neb[y], tela.px[y]
         for x in range(tela.W):
             c, a = linha[(x + off) % larg]
             if a > 0.02:
-                tela.misturar(x, y, c, a)
+                px[x] = conv(lerp_cor(px[x], c, a), estilo)
     estrelas(tela, t, vel=vel)
 
 
@@ -1203,12 +1298,465 @@ def reino(tela, t):
                  contorno=(20, 6, 6), sombra=(60, 10, 10), entrada="cair")
     rodape(tela, t, 12.0, "A LENDA DA CHAMA AZUL", fim // 2 + 1, 12.8)
 
+# ======================================================================== PULO DO GATO
+LARANJA = [(150, 62, 22), (205, 100, 36), (240, 146, 62), (255, 196, 120)]
+
+
+@functools.lru_cache(maxsize=64)
+def gato(h, quadro=0, forma="normal", morto=False):
+    """Pipoca, gato laranja de cachecol, correndo para a direita.
+
+    quadro: 0-3 ciclo de corrida, 4 no ar. forma: normal, achatado (pouso) ou esticado (pulo)."""
+    h = max(6, int(h))
+    sx, sy = {"normal": (1.0, 1.0), "achatado": (1.18, 0.82), "esticado": (0.88, 1.14)}[forma]
+    w = int(h * 1.5 * sx)
+    s = Spr(w, h)
+    X = lambda u: u * w
+    Y = lambda v: h - (1 - v) * h * sy  # achata em direção ao chão
+    escuro = (120, 46, 18)
+    # rabo em S, saindo da traseira para cima
+    for k in range(9):
+        a = k / 8
+        tx, ty = X(0.2 - 0.12 * a - 0.04 * math.sin(a * 3)), Y(0.48 - 0.42 * a)
+        s.elipse(tx, ty, max(0.6, h * 0.07), max(0.6, h * 0.07), cor=LARANJA[1] if k % 3 else escuro)
+    # pernas: duas de cada lado, defasadas
+    if quadro == 4:
+        pernas = [(0.3, -0.12), (0.4, -0.08), (0.68, 0.1), (0.78, 0.14)]
+    else:
+        fase = [0.0, 0.5, 1.0, 0.5][quadro % 4]
+        pernas = [(0.3, -0.06 + 0.12 * fase), (0.4, 0.06 - 0.12 * fase),
+                  (0.66, 0.06 - 0.12 * fase), (0.76, -0.06 + 0.12 * fase)]
+    for i, (px, desvio) in enumerate(pernas):
+        cor = LARANJA[0] if i % 2 == 0 else LARANJA[1]
+        s.poligono([(X(px - 0.04), Y(0.62)), (X(px + 0.05), Y(0.62)),
+                    (X(px + 0.05 + desvio), Y(0.98)), (X(px - 0.04 + desvio), Y(0.98))], [cor, cor])
+    s.elipse(X(0.5), Y(0.56), X(0.3), h * sy * 0.2, LARANJA)
+    s.elipse(X(0.8), Y(0.38), X(0.15), h * sy * 0.2, LARANJA)
+    for ex in (0.71, 0.86):
+        s.poligono([(X(ex - 0.055), Y(0.26)), (X(ex), Y(0.02)), (X(ex + 0.06), Y(0.26))], LARANJA[1:])
+    s.contorno((60, 22, 12))
+    for k in range(3):  # listras
+        x = X(0.36 + k * 0.1)
+        s.linha(x, Y(0.4), x - h * 0.04, Y(0.52), escuro)
+    for ex in (0.71, 0.86):
+        s.px[(int(X(ex)), int(Y(0.16)))] = (255, 170, 170)
+    s.elipse(X(0.92), Y(0.44), X(0.05), h * sy * 0.06, cor=(255, 236, 214))  # focinho
+    s.px[(int(X(0.965)), int(Y(0.4)))] = (230, 90, 110)
+    if morto:
+        ox, oy = int(X(0.84)), int(Y(0.33))
+        for d in (-1, 0, 1):
+            s.px[(ox + d, oy + d)] = s.px[(ox + d, oy - d)] = (20, 14, 20)
+    else:
+        olho = s.elipse(X(0.84), Y(0.33), max(0.6, X(0.022)), max(0.7, h * sy * 0.06), cor=(20, 14, 20))
+        if olho and h >= 14:
+            s.px[min(olho, key=lambda p: (p[1], p[0]))] = (255, 255, 255)
+    cachecol = [(150, 20, 30), (210, 40, 50), (250, 90, 90)]
+    s.poligono([(X(0.66), Y(0.44)), (X(0.76), Y(0.42)), (X(0.78), Y(0.56)), (X(0.66), Y(0.58))], cachecol)
+    s.poligono([(X(0.66), Y(0.5)), (X(0.6), Y(0.56)), (X(0.52), Y(0.7)), (X(0.6), Y(0.62))], cachecol)
+    return s
+
+
+@functools.lru_cache(maxsize=16)
+def novelo(h, cor=(236, 96, 150)):
+    """Novelo de lã com fio solto."""
+    h = max(3, int(h))
+    s = Spr(h + 2, h + 1)
+    rampa = [escurecer(cor, 0.45), escurecer(cor, 0.2), cor, clarear(cor, 0.4)]
+    r = h / 2
+    s.elipse(r, r, r, r, rampa)
+    if h >= 6:
+        for k in (-0.4, 0.0, 0.4):
+            for a in range(10):
+                ang = -1.2 + a * 0.24
+                x, y = r + math.cos(ang) * r * 0.75 + k * r * 0.5, r + math.sin(ang) * r * 0.75 * 0.6
+                if (x - r) ** 2 + (y - r) ** 2 < r * r * 0.8:
+                    s.px[(int(x), int(y))] = escurecer(cor, 0.35)
+    s.contorno(escurecer(cor, 0.7))
+    s.linha(r + r * 0.7, r + r * 0.6, h + 1, h, escurecer(cor, 0.3))
+    return s
+
+
+@functools.lru_cache(maxsize=32)
+def caixa(w, h):
+    """Caixote de madeira com tábuas e travessa em X."""
+    w, h = max(3, int(w)), max(3, int(h))
+    s = Spr(w, h)
+    mad = [(110, 64, 30), (150, 92, 44), (186, 124, 64), (214, 160, 96)]
+    s.poligono([(0, 0), (w, 0), (w, h), (0, h)], mad)
+    b = max(1, int(min(w, h) * 0.14))
+    escura = (90, 50, 24)
+    s.ret(0, 0, w, b, escura)
+    s.ret(0, h - b, w, h, escura)
+    s.ret(0, 0, b, h, escura)
+    s.ret(w - b, 0, w, h, escura)
+    if min(w, h) >= 6:
+        s.linha(b, b, w - b - 1, h - b - 1, escura)
+        s.linha(b, h - b - 1, w - b - 1, b, escura)
+    s.contorno((50, 26, 12))
+    return s
+
+
+def arvores(tela, off, base, alt, cor=(56, 130, 70), denso=1.0):
+    """Fila de árvores redondas em parallax (off em pixels)."""
+    passo = max(4.0, alt * 0.9 / denso)
+    k0 = int(math.floor(off / passo)) - 1
+    for k in range(k0, k0 + int(tela.W / passo) + 3):
+        x = k * passo - off + (_hash(k, 11) - 0.5) * passo * 0.6
+        a = alt * (0.7 + 0.5 * _hash(k, 12))
+        r = max(1.5, a * 0.42)
+        tela.retangulo(x - max(0.5, r * 0.18), base - a * 0.35, x + max(0.5, r * 0.18) + 1, base + 1, (88, 58, 40))
+        for y in range(int(base - a - r * 0.2), int(base - a * 0.3) + 1):
+            for xx in range(int(x - r) - 1, int(x + r) + 2):
+                dx, dy = (xx + 0.5 - x) / r, (y + 0.5 - (base - a * 0.68)) / (r * 1.05)
+                if dx * dx + dy * dy <= 1:
+                    luz = -dx * 0.5 - dy * 0.6
+                    tela.ponto(xx, y, clarear(cor, 0.22) if luz > 0.35 else escurecer(cor, 0.25) if luz < -0.3 else cor)
+
+
+def chao_tijolos(tela, gy, off, escala=1.0, buracos=()):
+    """Gramado em cima e terra de tijolos embaixo. buracos: intervalos [x0, x1) em pixels de tela."""
+    if gy >= tela.H:
+        return
+    c_grama, c_grama2 = tela.c((96, 186, 72)), tela.c((60, 140, 52))
+    c_terra, c_terra2, c_junta = tela.c((150, 92, 52)), tela.c((128, 76, 42)), tela.c((92, 52, 30))
+    tw, th = max(3, int(6 * escala)), max(2, int(3 * escala))
+    grama = max(1, int(1.6 * escala))
+    gy = int(gy)
+    for y in range(max(0, gy), tela.H):
+        linha = tela.px[y]
+        d = y - gy
+        fila = d // th
+        for x in range(tela.W):
+            wx = x + off
+            if d < grama:
+                c = c_grama if (int(wx) + d) % 5 else c_grama2
+            elif d == grama:
+                c = c_grama2
+            elif (d % th) == 0 or (int(wx) + (fila % 2) * (tw // 2)) % tw == 0:
+                c = c_junta
+            else:
+                c = c_terra if (fila + int(wx) // tw) % 3 else c_terra2
+            linha[x] = c
+    for x0, x1 in buracos:
+        for y in range(max(0, gy), tela.H):
+            p = (y - gy) / max(1, tela.H - gy)
+            tela.retangulo(x0, y, x1, y + 1, lerp_cor((30, 22, 40), (6, 4, 12), p))
+        tela.retangulo(x0, gy, x0 + 1, tela.H, (70, 40, 24))
+        tela.retangulo(x1 - 1, gy, x1, tela.H, (70, 40, 24))
+
+
+CEU_AURORA = [(0, (40, 60, 140)), (0.5, (200, 120, 160)), (1, (255, 200, 150))]
+
+
+def colinas(tela, off, gy, ceu=CEU_DIA, noite=0.0):
+    """Cenário de fundo do Pulo do Gato: céu, montanhas, nuvens e árvores em parallax."""
+    tela.ceu(ceu)
+    if noite > 0:
+        estrelas(tela, off * 0.02, 0.6)
+    H = tela.H
+    montanhas(tela, gy, H * 0.42, off * 0.1, escurecer((130, 160, 210), noite * 0.6), 0.5, neve=(240, 245, 255))
+    if noite < 0.5:
+        nuvens(tela, -off * 0.08, vel=1)  # andam para trás, mais devagar que o chão
+    montanhas(tela, gy, H * 0.24, off * 0.25 + 40, escurecer((92, 160, 110), noite * 0.6), 2.3)
+    arvores(tela, off * 0.5, gy, H * 0.2, escurecer((50, 128, 64), noite * 0.6))
+
+
+def gato_salto(t, t0, dur, alt):
+    """Altura de um pulo parabólico que começa em t0."""
+    q = (t - t0) / dur
+    return 4 * alt * q * (1 - q) if 0 <= q <= 1 else 0.0
+
+
+def gato_abertura(tela, t):
+    W, H = tela.W, tela.H
+    gy = int(H * 0.8)
+    hg = int(min(H * 0.24, W * 0.14))
+    if t < 3.0:
+        p = ease(t / 3.0)
+        ceu = [(s, lerp_cor(c, d, p)) for (s, c), (_, d) in zip(
+            [(0, (10, 12, 40)), (0.5, (60, 40, 110)), (1, (150, 80, 120))],
+            [(0, (64, 120, 225)), (0.5, (190, 150, 190)), (1, (255, 210, 150))])]
+        colinas(tela, 0, gy, ceu, noite=1 - p)
+        sy = lerp(H * 0.85, H * 0.3, p)
+        tela.brilho(W * 0.75, sy, H * 0.35, (255, 220, 150), 0.6)
+        tela.circulo(W * 0.75, sy, max(2, H * 0.08), (255, 240, 190))
+        chao_tijolos(tela, gy, 0)
+        if hg >= 6:
+            tela.sombra(W * 0.3 + hg * 0.7, gy + 1, hg * 0.6, max(1, hg * 0.08))
+            tela.desenhar(gato(hg, 0, "achatado"), W * 0.3, gy - hg + 1)
+            for k in range(3):
+                q = (t * 0.6 + k / 3) % 1
+                tela.letra("Z", W * 0.3 + hg * 1.2 + q * hg * 0.6, gy - hg - q * hg * 0.8, 1,
+                           lerp_cor((255, 255, 255), (150, 150, 200), q))
+        if 0.8 <= t <= 2.8:
+            a = min(1, (t - 0.8) / 0.4, (2.8 - t) / 0.4)
+            tela.texto(tela.rows // 4, "No alto das colinas, um gato acorda...", lerp_cor((20, 20, 50), (255, 255, 255), a))
+        return
+    if t < 10.0:
+        vel = W * 0.55
+        off = (t - 3.0) * vel
+        colinas(tela, off, gy)
+        tela.brilho(W * 0.85, H * 0.18, H * 0.25, (255, 250, 210), 0.5)
+        # buracos e pulos sincronizados: o gato pula em tp e o buraco passa embaixo dele
+        gx = W * 0.25
+        pulos = [4.4, 5.6, 6.9, 8.2]
+        buracos = []
+        for tp in pulos:
+            centro = gx + hg * 0.75 + (tp + 0.35 - t) * vel
+            buracos.append((centro - hg * 0.6, centro + hg * 0.6))
+        chao_tijolos(tela, gy, off, max(1.0, H / 48), buracos)
+        alt = sum(gato_salto(t, tp, 0.7, hg * 1.4) for tp in pulos)
+        no_ar = alt > 0
+        for k in range(10):
+            nx = gx + (pulos[k % 4] + 0.35 - t) * vel + (k // 4) * hg * 0.4
+            ny = gy - hg * 2.1 + math.sin(t * 5 + k) * 1.5
+            pego = t > pulos[k % 4] + 0.3 and k < 8
+            if not pego and -hg < nx < W + hg:
+                tela.brilho(nx + hg * 0.15, ny + hg * 0.15, hg * 0.4, (255, 200, 220), 0.4)
+                tela.desenhar(novelo(hg * 0.35), nx, ny)
+        quadro = 4 if no_ar else int(t * 12) % 4
+        forma = "esticado" if 0 < alt and any(0 <= t - tp < 0.2 for tp in pulos) else \
+            "achatado" if any(0 <= t - tp - 0.7 < 0.1 for tp in pulos) else "normal"
+        tela.sombra(gx + hg * 0.75, gy + 1, hg * 0.6 * (1 - alt / (hg * 3)), max(1, hg * 0.08))
+        tela.desenhar(gato(hg, quadro, forma), gx, gy - hg + 1 - alt)
+        for tp in pulos:
+            q = (t - tp - 0.7) / 0.5
+            if 0 <= q < 1:
+                for k in range(5):
+                    tela.brilho(gx + hg * (0.2 + 0.25 * k) - q * hg * 0.8, gy - q * hg * 0.3, hg * 0.12,
+                                (220, 200, 160), 0.7 * (1 - q))
+        if t >= 9.4:
+            tela.flash((t - 9.4) / 0.6)
+        return
+    colinas(tela, t * 6, gy, CEU_POR)
+    tela.brilho(W * 0.5, gy, H * 0.5, (255, 200, 140), 0.5)
+    chao_tijolos(tela, gy, t * 6, max(1.0, H / 48))
+    if t < 10.4:
+        tela.flash(1 - (t - 10.0) / 0.4)
+    fim = titulo(tela, ["PULO DO", "GATO"], t, 10.2, [(255, 250, 200), (255, 210, 80), (240, 130, 40)],
+                 contorno=(50, 24, 10), sombra=(120, 50, 30), entrada="cair")
+    hh = int(min(hg * 1.3, max(0, gy - fim - 4)))
+    if hh >= 8 and t >= 10.8:
+        q = ease((t - 10.8) / 0.8)
+        gx = lerp(-hh * 2, W * 0.5 - hh * 0.75, q)
+        pulo = gato_salto(t, 12.0 + int((t - 12.0) / 1.6) * 1.6, 0.6, hh * 0.6) if t >= 12.0 else 0
+        tela.sombra(gx + hh * 0.75, gy + 1, hh * 0.6, max(1, hh * 0.08))
+        tela.desenhar(gato(hh, 4 if pulo else int(t * 10) % 4 if q < 1 else 0), gx, gy - hh + 1 - pulo)
+    for k in range(6):
+        fase = (t * 0.5 + k / 6) % 1
+        x = (k * 0.17 + 0.08) * W
+        y = lerp(gy - 2, fim + 2, fase)
+        tela.desenhar(novelo(max(3, hg * 0.3), [(236, 96, 150), (90, 160, 240), (250, 210, 80)][k % 3]),
+                      x + math.sin(t * 2 + k) * 3, y)
+    rodape(tela, t, 11.6, "CORRA, PULE, MIE", fim // 2 + 1, 12.4)
+
+
+# ======================================================================== TOCHA ETERNA
+@functools.lru_cache(maxsize=32)
+def mago(h, passo=0, lado=1):
+    """Nox, mago encapuzado de manto roxo segurando um cajado-tocha. lado: 1 direita, -1 esquerda."""
+    h = max(6, int(h))
+    w = max(5, int(h * 0.75))
+    s = Spr(w, h)
+    manto = [(46, 20, 82), (78, 38, 128), (112, 62, 170), (150, 100, 205)]
+    ab = [0, 0.04, 0, -0.04][passo % 4] * w
+    s.poligono([(w * 0.42, h * 0.2), (w * 0.62, h * 0.22), (w * 0.8 + ab, h * 0.98),
+                (w * 0.14 - ab, h * 0.98)], manto)
+    s.poligono([(w * 0.5, h * 0.0), (w * 0.3, h * 0.14), (w * 0.3, h * 0.36), (w * 0.72, h * 0.36),
+                (w * 0.74, h * 0.16)], manto)
+    s.ret(w * 0.26, h * 0.62, w * 0.76, h * 0.62 + max(1, h * 0.04), (210, 170, 70))
+    s.contorno((20, 8, 34))
+    s.elipse(w * 0.6, h * 0.24, w * 0.12, h * 0.08, cor=(14, 6, 20))
+    for ex in (0.55, 0.67):
+        s.px[(int(w * ex), int(h * 0.24))] = (255, 220, 80)
+    s.linha(w * 0.86, h * 0.14, w * 0.86, h * 0.99, (120, 80, 40), max(1, int(h * 0.04)))
+    s.ret(w * 0.66, h * 0.44, w * 0.88, h * 0.5, (112, 62, 170))
+    if lado < 0:
+        espelho = Spr(w, h)
+        espelho.px = {(w - 1 - x, y): c for (x, y), c in s.px.items()}
+        s = espelho
+    s.ponta = ((w * 0.86) if lado > 0 else (w - 1 - w * 0.86), h * 0.1)
+    return s
+
+
+@functools.lru_cache(maxsize=16)
+def bau(w, aberto=False):
+    w = max(6, int(w))
+    h = int(w * 0.7)
+    s = Spr(w, h)
+    mad = [(90, 50, 24), (130, 78, 36), (170, 110, 52), (200, 146, 80)]
+    ouro = (230, 180, 60)
+    if aberto:
+        s.poligono([(0, h * 0.05), (w, h * 0.05), (w * 0.95, h * 0.3), (w * 0.05, h * 0.3)], [(40, 20, 10), (60, 34, 16)])
+    else:
+        s.poligono([(w * 0.04, h * 0.08), (w * 0.96, h * 0.08), (w, h * 0.42), (0, h * 0.42)], mad)
+    s.poligono([(0, h * 0.4), (w, h * 0.4), (w, h), (0, h)], mad)
+    for fx in (0.12, 0.84):
+        s.ret(w * fx, h * (0.3 if aberto else 0.08), w * fx + max(1, w * 0.06), h, ouro)
+    s.ret(0, h * 0.4, w, h * 0.4 + max(1, h * 0.06), (60, 30, 14))
+    s.contorno((30, 14, 6))
+    s.ret(w * 0.44, h * 0.42, w * 0.56, h * 0.6, ouro)
+    return s
+
+
+@functools.lru_cache(maxsize=16)
+def cristal(h):
+    h = max(4, int(h))
+    w = max(3, int(h * 0.55))
+    s = Spr(w, h)
+    rampa = [(30, 90, 160), (60, 160, 230), (140, 220, 255), (230, 250, 255)]
+    s.poligono([(w * 0.5, 0), (w, h * 0.42), (w * 0.5, h), (0, h * 0.42)], rampa)
+    s.linha(w * 0.5, 1, w * 0.5, h - 2, (200, 245, 255))
+    s.contorno((14, 40, 80))
+    return s
+
+
+def parede_tijolos(tela, off=0.0, y0=0, y1=None, escala=1.0, cor=(70, 72, 96), luzes=()):
+    """Parede de pedra em tijolos. luzes: [(x, y, raio, força)] em pixels; fora delas fica escuro."""
+    y1 = tela.H if y1 is None else y1
+    tw, th = max(4, int(8 * escala)), max(2, int(3 * escala))
+    base, clara, junta = cor, clarear(cor, 0.12), escurecer(cor, 0.45)
+    luzes = [luz for luz in luzes if luz[2] > 0]
+    for y in range(max(0, int(y0)), min(tela.H, int(y1))):
+        fila = (y - int(y0)) // th
+        linha = tela.px[y]
+        for x in range(tela.W):
+            wx = int(x + off)
+            if (y - int(y0)) % th == 0 or (wx + (fila % 2) * (tw // 2)) % tw == 0:
+                c = junta
+            else:
+                c = clara if _hash(wx // tw + fila * 7, fila) > 0.7 else base
+            luz = 0.12
+            for lx, ly, r, f in luzes:
+                d = ((x - lx) ** 2 + ((y - ly) * 1.1) ** 2) / (r * r)
+                if d < 1:
+                    luz += f * (1 - d)
+            linha[x] = tela.c(lerp_cor((4, 3, 8), c, min(1.0, luz)) if luz < 1 else
+                              lerp_cor(c, (255, 200, 140), min(0.35, (luz - 1) * 0.3)))
+
+
+def chama(tela, x, y, tam, t, semente=0):
+    """Chama tremulante com núcleo claro, centrada na base (x, y)."""
+    tam = max(1.5, tam)
+    tremor = 0.8 + 0.25 * math.sin(t * 17 + semente) + 0.15 * math.sin(t * 29 + semente * 2)
+    tela.brilho(x, y - tam * 0.6, tam * 3.2, (255, 150, 60), 0.35)
+    for k, (cor, f) in enumerate((((230, 70, 20), 1.0), ((255, 160, 40), 0.7), ((255, 240, 170), 0.4))):
+        hh = tam * 2.0 * f * tremor
+        r = tam * 0.7 * f
+        for yy in range(int(y - hh), int(y) + 1):
+            q = (y - yy) / max(0.5, hh)
+            meia = r * math.sqrt(max(0.0, 1 - q)) * (1 + 0.3 * math.sin(t * 13 + yy + semente))
+            if meia > 0.3:
+                tela.retangulo(x - meia + math.sin(t * 9 + yy * 0.7 + semente) * q * r * 0.5, yy,
+                               x + meia + math.sin(t * 9 + yy * 0.7 + semente) * q * r * 0.5 + 1, yy + 1, cor)
+
+
+def tocha_parede(tela, x, y, tam, t, semente=0):
+    tela.retangulo(x - tam * 0.3, y, x + tam * 0.3 + 1, y + tam * 1.6, (80, 50, 30))
+    tela.retangulo(x - tam * 0.5, y, x + tam * 0.5 + 1, y + max(1, tam * 0.3), (60, 60, 70))
+    chama(tela, x, y, tam, t, semente)
+
+
+def faiscas(tela, t, n, cor, x0, x1, y0, y1, semente=0):
+    for k in range(n):
+        fase = (t * (0.3 + 0.3 * _hash(k, semente)) + _hash(k, semente + 1)) % 1
+        x = lerp(x0, x1, _hash(k, semente + 2)) + math.sin(t * 3 + k) * 2
+        tela.misturar(x, lerp(y1, y0, fase), cor, 1 - fase)
+
+
+def tocha_abertura(tela, t):
+    W, H = tela.W, tela.H
+    piso = int(H * 0.8)
+    e = max(1.0, H / 48)
+    tam = max(1.5, H * 0.04)
+    if t < 3.5:
+        acesa = ease((t - 1.0) / 1.5)
+        luzes = [(W * 0.5, H * 0.35, max(2, H * 0.5 * acesa), 1.6 * acesa)] if t >= 1.0 else []
+        tela.retangulo(0, 0, W, H, (2, 2, 6))
+        parede_tijolos(tela, 0, 0, piso, e, luzes=luzes)
+        tela.retangulo(0, piso, W, H, (10, 8, 16))
+        if t >= 1.0:
+            tocha_parede(tela, W * 0.5, H * 0.35, tam * acesa, t)
+        else:
+            q = t / 1.0
+            tela.brilho(W * 0.5, H * 0.35, tam * 2, (255, 180, 80), q * 0.8)
+        if 1.6 <= t <= 3.4:
+            a = min(1, (t - 1.6) / 0.4, (3.4 - t) / 0.4)
+            tela.texto(tela.rows // 6, "As profundezas guardam um segredo...", lerp_cor((10, 8, 20), (210, 200, 220), a))
+        return
+    if t < 10.0:
+        off = (t - 3.5) * W * 0.06
+        tx = [W * f - off for f in (0.1, 0.35, 0.6, 0.85, 1.1)]
+        hm = int(min(H * 0.38, W * 0.2))
+        mx = lerp(-hm, W * 0.42, ease((t - 3.5) / 3.0))
+        bx, bw = W * 0.62, max(6, hm * 0.8)
+        aberto = t >= 7.6
+        luzes = [(x, H * 0.32, H * 0.28, 1.2) for x in tx]
+        luzes.append((mx + hm * 0.6, piso - hm, H * 0.4, 1.0))
+        if aberto:
+            luzes.append((bx + bw / 2, piso - bw * 0.5, H * 0.5 * ease((t - 7.6) / 0.6), 1.5))
+        parede_tijolos(tela, off, 0, piso, e, luzes=luzes)
+        for y in range(piso, H):
+            tela.retangulo(0, y, W, y + 1, lerp_cor((40, 34, 52), (10, 8, 16), (y - piso) / max(1, H - piso)))
+        for i, x in enumerate(tx):
+            tocha_parede(tela, x, H * 0.32, tam, t, i)
+        if hm >= 6:
+            if aberto:
+                q = min(1.0, (t - 7.6) / 0.5)
+                for k in range(14):
+                    ang = math.pi + k * math.pi / 13
+                    r = H * 0.45 * q * (0.6 + 0.4 * _hash(k, 1))
+                    tela.linha(bx + bw / 2, piso - bw * 0.5, bx + bw / 2 + math.cos(ang) * r,
+                               piso - bw * 0.5 + math.sin(ang) * r, (255, 220, 120), 0.35)
+            tela.sombra(bx + bw / 2, piso, bw * 0.6, max(1, bw * 0.08))
+            tela.desenhar(bau(bw, aberto), bx, piso - int(bw * 0.7))
+            if t >= 8.0:
+                q = ease((t - 8.0) / 1.0)
+                cy = lerp(piso - bw * 0.5, piso - bw * 0.5 - H * 0.3, q) + math.sin(t * 3) * 1.5
+                tela.brilho(bx + bw / 2, cy, H * 0.18, (120, 200, 255), 0.7)
+                c = cristal(hm * 0.4)
+                tela.desenhar(c, bx + bw / 2 - c.w / 2, cy - c.h / 2)
+                faiscas(tela, t, 10, (200, 240, 255), bx - bw * 0.3, bx + bw * 1.3, cy - H * 0.2, cy + H * 0.15)
+            andando = mx < W * 0.42 - 1
+            sp = mago(hm, int(t * 6) % 4 if andando else 0)
+            tela.sombra(mx + hm * 0.38, piso, hm * 0.35, max(1, hm * 0.06))
+            tela.desenhar(sp, mx, piso - hm + 1)
+            chama(tela, mx + sp.ponta[0], piso - hm + 1 + sp.ponta[1], tam * 0.8, t, 7)
+        faiscas(tela, t, 14, (255, 170, 80), 0, W, 0, piso, 3)
+        if t >= 9.4:
+            tela.flash((t - 9.4) / 0.6, (0, 0, 0))
+        return
+    luzes = [(W * f, H * 0.62, H * 0.42, 1.3) for f in (0.08, 0.38, 0.62, 0.92)]
+    luzes.append((W * 0.72, H * 0.72, H * 0.3, 0.9 + 0.2 * math.sin(t * 3)))
+    parede_tijolos(tela, 0, 0, piso, e, luzes=luzes)
+    tela.retangulo(0, piso, W, H, (14, 10, 22))
+    for i, f in enumerate((0.08, 0.38, 0.62, 0.92)):
+        x = W * f
+        tela.retangulo(x - tam * 0.5, H * 0.62, x + tam * 0.5 + 1, piso + 1, (70, 44, 26))
+        chama(tela, x, H * 0.62, tam * 1.6, t, i)
+    if t < 10.4:
+        tela.flash(1 - (t - 10.0) / 0.4, (0, 0, 0))
+    fim = titulo(tela, ["TOCHA", "ETERNA"], t, 10.2, [(255, 250, 210), (255, 200, 90), (200, 110, 40)],
+                 contorno=(20, 10, 4), sombra=(60, 30, 10), entrada="revelar")
+    if t >= 11.0:
+        hc = max(4, int(min(H * 0.18, piso - fim - 4)))
+        cy = (fim + piso) / 2 + math.sin(t * 2.5) * 2
+        tela.brilho(W * 0.72, cy, hc * 1.6, (120, 200, 255), 0.6 * ease((t - 11.0) / 0.8))
+        c = cristal(hc)
+        tela.desenhar(c, W * 0.72 - c.w / 2, cy - c.h / 2)
+        faiscas(tela, t, 8, (200, 240, 255), W * 0.6, W * 0.84, cy - hc, cy + hc, 9)
+    faiscas(tela, t, 20, (255, 170, 80), 0, W, fim, piso, 5)
+    rodape(tela, t, 11.8, "UMA AVENTURA NAS PROFUNDEZAS", fim // 2 + 1, 12.6)
+
+
 # ======================================================================== registro
 ABERTURAS = {
     "elementra": ("Elementra", "monstros e batalhas", 20.0, elementra),
     "turbo": ("Turbo Asfalto", "corrida com pista em pseudo-3D", 16.0, turbo),
     "astro": ("Astro Vértice", "nave espacial e chefe gigante", 16.0, astro),
     "reino": ("Reino de Cinza", "fantasia com castelo e dragão", 16.0, reino),
+    "gato": ("Pulo do Gato", "gato corredor entre colinas e novelos", 16.0, gato_abertura),
+    "tocha": ("Tocha Eterna", "masmorra iluminada à tocha", 16.0, tocha_abertura),
 }
 ORDEM_ESTILOS = ["gb", "gbc", "gba"]
 
@@ -1219,49 +1767,1762 @@ def quadro(nome, estilo, t, tamanho=None):
     return tela
 
 
-# ======================================================================== execução
-class Teclado:
-    """Lê teclas sem bloquear (q, espaço, setas, e)."""
+# ======================================================================== motor: entrada
+ACOES = {
+    "pular": {" ", "w", "↑", "k", "z"},
+    "acao": {" ", "z", "x", "enter"},
+    "cima": {"w", "↑", "k"},
+    "baixo": {"s", "↓", "j"},
+    "esquerda": {"a", "←", "h"},
+    "direita": {"d", "→", "l"},
+    "start": {"enter", " "},
+    "pausa": {"p", "esc"},
+    "sair": {"q", "ctrl+c"},
+    "estilo": {"e"},
+    "proxima": {"tab", "→", "n"},
+}
+_CSI = re.compile(r"\x1b\[([?>]?[0-9:;]*)([A-Za-z~])|\x1bO([A-D])|\x1b(.)?", re.S)
+_SETAS = {"A": "↑", "B": "↓", "C": "→", "D": "←"}
+_CODIGOS = {13: "enter", 27: "esc", 32: " ", 9: "tab", 127: "backspace"}
+_BYTES = {"\r": "enter", "\n": "enter", "\t": "tab", "\x7f": "backspace", "\x03": "ctrl+c"}
+
+
+def ler_teclas(dados):
+    """Decodifica bytes do terminal em eventos (tecla, tipo, kitty).
+
+    tipo: 1 apertou, 2 repetição, 3 soltou. kitty=True quando o evento veio do
+    protocolo de teclado do kitty (com tipo explícito); False para bytes comuns,
+    cujo "soltou" o chamador estima por tempo."""
+    eventos, i = [], 0
+    while i < len(dados):
+        m = _CSI.match(dados, i)
+        if not m:
+            ch = dados[i]
+            eventos.append((_BYTES.get(ch, ch.lower()), 1, False))
+            i += 1
+            continue
+        i = m.end()
+        params, final, ss3, alt = m.groups()
+        if ss3:
+            eventos.append((_SETAS[ss3], 1, False))
+        elif final is None:
+            eventos.append(("esc", 1, False) if alt is None else (_BYTES.get(alt, alt.lower()), 1, False))
+        elif params[:1] in ("?", ">"):
+            continue  # respostas de consulta ao terminal
+        else:
+            partes = params.split(";") if params else []
+            mods, tipo = 1, 1
+            if len(partes) > 1:
+                sub = partes[1].split(":")
+                mods = int(sub[0] or 1)
+                tipo = int(sub[1]) if len(sub) > 1 and sub[1] else 1
+            kitty = len(partes) > 1 and ":" in partes[1] or final == "u"
+            if final == "u":
+                cod = int(partes[0].split(":")[0] or 0)
+                tecla = _CODIGOS.get(cod) or (chr(cod).lower() if 32 < cod < 0xE000 else f"k{cod}")
+                if (mods - 1) & 4 and len(tecla) == 1:
+                    tecla = "ctrl+" + tecla
+            elif final in _SETAS:
+                tecla = _SETAS[final]
+            else:
+                continue
+            eventos.append((tecla, tipo, kitty))
+    return eventos
+
+
+class Entrada:
+    """Teclado sem bloquear, com apertou/segurando/soltou por tick.
+
+    Modo kitty: o terminal informa apertar, repetir e soltar de verdade.
+    Modo fallback: só chegam bytes; a tecla conta como segurada até ESPERA
+    segundos depois do último byte (bom para toques, impreciso para segurar)."""
+
+    ESPERA = 0.15
+
+    def __init__(self, acoes=None, kitty=False):
+        self.acoes = acoes or ACOES
+        self.querer_kitty = kitty
+        self.modo = "nenhum"
+        self.fd = None
+        self.seg = {}  # tecla -> instante do último byte (fallback) ou None (kitty)
+        self.apert, self.solt, self.rep = set(), set(), set()
+        self.eventos = []  # eventos crus deste tick: (tecla, tipo)
 
     def __enter__(self):
-        self.fd = None
         if termios and sys.stdin.isatty():
             self.fd = sys.stdin.fileno()
             self.antigo = termios.tcgetattr(self.fd)
             tty.setcbreak(self.fd)
+            self.modo = "fallback"
+            if self.querer_kitty and self._detectar_kitty():
+                self.modo = "kitty"
+                _escrever_stdout("\x1b[>11u")  # 1 desambiguar + 2 tipos de evento + 8 tudo como escape
         return self
 
     def __exit__(self, *_):
+        self.desligar()
         if self.fd is not None:
             termios.tcsetattr(self.fd, termios.TCSADRAIN, self.antigo)
+            self.fd = None
 
-    def ler(self):
-        if self.fd is None:
+    def desligar(self):
+        """Devolve o teclado ao normal. Seguro chamar mais de uma vez (finally e SIGTERM)."""
+        if self.modo == "kitty":
+            _escrever_stdout("\x1b[<u")
+            self.modo = "fallback"
+
+    def _detectar_kitty(self, limite=0.25):
+        # Pergunta as flags do kitty e, logo atrás, os atributos do terminal (DA1), que
+        # todo terminal responde: se o DA1 chega sem a resposta do kitty, não há suporte.
+        _escrever_stdout("\x1b[?u\x1b[c")
+        resp, fim = "", time.monotonic() + limite
+        while time.monotonic() < fim:
+            pronto, _, _ = select.select([self.fd], [], [], max(0.0, fim - time.monotonic()))
+            if not pronto:
+                break
+            resp += os.read(self.fd, 256).decode(errors="ignore")
+            if re.search(r"\x1b\[\?[0-9;]*c", resp):
+                break
+        return re.search(r"\x1b\[\?[0-9]+u", resp) is not None
+
+    def ler(self, agora=None):
+        agora = time.monotonic() if agora is None else agora
+        if self.fd is not None:
+            dados = ""
+            while select.select([self.fd], [], [], 0)[0]:
+                bloco = os.read(self.fd, 1024)
+                if not bloco:
+                    break
+                dados += bloco.decode(errors="ignore")
+            for tecla, tipo, kitty in ler_teclas(dados):
+                self.injetar(tecla, tipo, None if kitty else agora)
+        for tecla, quando in list(self.seg.items()):
+            if quando is not None and agora - quando > self.ESPERA:
+                del self.seg[tecla]
+                self.solt.add(tecla)
+
+    def injetar(self, tecla, tipo=1, quando=None):
+        """Registra um evento. quando=None: evento com tipo exato (kitty, replay, teste)."""
+        self.eventos.append((tecla, tipo))
+        if tipo == 3:
+            self.seg.pop(tecla, None)
+            self.solt.add(tecla)
+            return
+        if tipo == 2 or (quando is not None and tecla in self.seg):
+            self.rep.add(tecla)
+        else:
+            self.apert.add(tecla)
+        self.seg[tecla] = quando
+
+    def _teclas(self, acao):
+        if isinstance(acao, (set, frozenset)):
+            return acao
+        return self.acoes.get(acao, {acao})
+
+    def apertou(self, acao, repetir=False):
+        t = self._teclas(acao)
+        return not t.isdisjoint(self.apert) or (repetir and not t.isdisjoint(self.rep))
+
+    def segurando(self, acao):
+        return not self._teclas(acao).isdisjoint(self.seg)
+
+    def soltou(self, acao):
+        return not self._teclas(acao).isdisjoint(self.solt)
+
+    def algo(self):
+        """Alguma tecla foi apertada neste tick?"""
+        return bool(self.apert)
+
+    def fim_do_tick(self):
+        self.eventos.clear()
+        self.apert.clear()
+        self.solt.clear()
+        self.rep.clear()
+
+
+# ======================================================================== motor: mundo
+MUNDO_H = 48      # altura do mundo em unidades; o chão dos jogos de plataforma fica a 80%
+MUNDO_W_MIN = 64  # largura mínima visível, para terminais estreitos não esconderem o que vem
+TAM_MIN = (80, 24)
+
+
+class Camera:
+    """Converte coordenadas do mundo (altura fixa MUNDO_H) para pixels da tela.
+
+    O tamanho do terminal muda a escala e quanto se vê à frente, nunca a física."""
+
+    def __init__(self, x=0.0, y=0.0):
+        self.x, self.y = x, y
+        self.tremor = 0.0
+        self.dx = self.dy = 0.0
+        self.escala = 1.0
+        self.W = self.H = 0
+
+    def ajustar(self, tela):
+        self.W, self.H = tela.W, tela.H
+        self.escala = min(tela.H / MUNDO_H, tela.W / MUNDO_W_MIN)
+
+    def largura_visivel(self):
+        return self.W / self.escala
+
+    def tremer(self, forca):
+        self.tremor = max(self.tremor, forca)
+
+    def atualizar(self, dt, rng):
+        self.tremor = max(0.0, self.tremor - dt * 6)
+        a = self.tremor * self.tremor * 3
+        self.dx, self.dy = (rng.random() - 0.5) * a, (rng.random() - 0.5) * a
+
+    def tx(self, wx):
+        return (wx - self.x + self.dx) * self.escala
+
+    def ty(self, wy):
+        # o fundo do mundo (y = MUNDO_H) encosta no fundo da tela; sobra céu em cima
+        return self.H - (MUNDO_H - (wy - self.y + self.dy)) * self.escala
+
+    def px(self, w):
+        """Tamanho em pixels de uma medida do mundo."""
+        return w * self.escala
+
+
+def colide(a, b, folga=0.15):
+    """AABB (x, y, w, h) com as caixas encolhidas em `folga` de cada lado: passar
+    raspando conta como passar."""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    fa, fb = aw * folga, bw * folga
+    ga, gb = ah * folga, bh * folga
+    return (ax + fa < bx + bw - fb and bx + fb < ax + aw - fa and
+            ay + ga < by + bh - gb and by + gb < ay + ah - ga)
+
+
+class Particulas:
+    """Pool de partículas reaproveitável: posição, velocidade, vida, gravidade e cor."""
+
+    def __init__(self, tamanho=160):
+        self.p = [[0.0] * 8 + [None] for _ in range(tamanho)]  # x y vx vy vida total grav tam cor
+        self.livre = 0
+
+    def emitir(self, x, y, vx, vy, vida, cor, grav=0.0, tam=1.0):
+        for k in range(len(self.p)):
+            i = (self.livre + k) % len(self.p)
+            if self.p[i][4] <= 0:
+                self.p[i][:] = [x, y, vx, vy, vida, vida, grav, tam, cor]
+                self.livre = i + 1
+                return
+
+    def explodir(self, rng, x, y, n, vel, vida, cores, grav=0.0, tam=1.0, cone=(0, 2 * math.pi)):
+        for _ in range(n):
+            ang = cone[0] + rng.random() * (cone[1] - cone[0])
+            v = vel * (0.4 + 0.6 * rng.random())
+            self.emitir(x, y, math.cos(ang) * v, math.sin(ang) * v, vida * (0.6 + 0.4 * rng.random()),
+                        cores[rng.randrange(len(cores))], grav, tam)
+
+    def atualizar(self, dt):
+        for q in self.p:
+            if q[4] > 0:
+                q[3] += q[6] * dt
+                q[0] += q[2] * dt
+                q[1] += q[3] * dt
+                q[4] -= dt
+
+    def vivas(self):
+        return [q for q in self.p if q[4] > 0]
+
+    def desenhar(self, tela, cam=None):
+        for x, y, _, _, vida, total, _, tam, cor in self.vivas():
+            sx, sy = (cam.tx(x), cam.ty(y)) if cam else (x, y)
+            r = (cam.px(tam) if cam else tam) * (0.5 + 0.5 * vida / total)
+            if r < 0.9:
+                tela.misturar(sx, sy, cor, min(1.0, vida / total * 1.5))
+            else:
+                tela.brilho(sx, sy, r * 1.6, cor, min(1.0, vida / total * 1.5))
+
+
+class Recordes:
+    """Melhores pontuações por jogo, em $XDG_DATA_HOME/termboy/recordes.json."""
+
+    MAX = 5
+
+    def __init__(self, caminho=None):
+        if caminho is None:
+            base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+            caminho = os.path.join(base, "termboy", "recordes.json")
+        self.caminho = caminho
+
+    def carregar(self):
+        try:
+            with open(self.caminho) as f:
+                dados = json.load(f)
+            return dados if isinstance(dados, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def tabela(self, jogo):
+        return self.carregar().get(jogo, [])
+
+    def registrar(self, jogo, pontos):
+        """Grava a pontuação se ela entrar na tabela. Devolve a posição (0 = melhor) ou None."""
+        dados = self.carregar()
+        tab = dados.get(jogo, [])
+        item = {"pontos": int(pontos), "data": time.strftime("%Y-%m-%d")}
+        tab.append(item)
+        tab.sort(key=lambda r: -r["pontos"])
+        tab = tab[: self.MAX]
+        if item not in tab or pontos <= 0:
             return None
-        pronto, _, _ = select.select([sys.stdin], [], [], 0)
-        return os.read(self.fd, 16).decode(errors="ignore") if pronto else None
+        dados[jogo] = tab
+        try:
+            os.makedirs(os.path.dirname(self.caminho), exist_ok=True)
+            tmp = self.caminho + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(dados, f, indent=1)
+            os.replace(tmp, self.caminho)
+        except OSError:
+            return None
+        return tab.index(item)
 
 
-def tocar(nome, estado, teclado):
+# ======================================================================== motor: laço
+PASSO = 1 / 30
+
+
+class Laco:
+    """Lógica em passo fixo (30 Hz) com acumulador; o desenho roda na taxa que der."""
+
+    def __init__(self, entrada, saida, fps=30):
+        self.entrada, self.saida, self.fps = entrada, saida, fps
+        self.redimensionou = False
+
+    def rodar(self, atualizar, desenhar):
+        """atualizar(dt, entrada) devolve None para continuar; desenhar() devolve a Tela."""
+        acum, antes = 0.0, time.monotonic()
+        while True:
+            agora = time.monotonic()
+            acum += min(agora - antes, 0.25)  # evita a espiral depois de uma travada
+            antes = agora
+            self.entrada.ler(agora)
+            while acum >= PASSO:
+                r = atualizar(PASSO, self.entrada)
+                self.entrada.fim_do_tick()
+                acum -= PASSO
+                if r is not None:
+                    return r
+            if self.redimensionou:
+                self.redimensionou = False
+                self.saida.forcar()
+            self.saida.mostrar(desenhar())
+            time.sleep(max(0.0, 1 / self.fps - (time.monotonic() - agora)))
+
+
+# ======================================================================== jogos: base
+class Jogo:
+    """Ciclo de vida de um jogo. A lógica só avança em atualizar(), em passos fixos, e
+    só usa self.rng: com a mesma semente e as mesmas teclas, a partida se repete igual."""
+
+    nome = ""      # chave em JOGOS
+    titulo = ""
+    abertura = ""  # abertura que serve de tela de título
+    dicas = ""     # linha de teclas mostrada no começo da partida
+
+    def iniciar(self, semente):
+        self.semente = semente
+        self.rng = random.Random(semente)
+        self.t = 0.0
+
+    def atualizar(self, dt, ent):
+        """Avança um passo. Devolve None ou "fim" (game over, depois da animação)."""
+        self.t += dt
+
+    def desenhar(self, tela):
+        raise NotImplementedError
+
+    def pontos(self):
+        return 0
+
+
+def hud_texto(tela, txt, x, y, s=1, cor=(255, 255, 255), contorno=(20, 12, 30), direita=False):
+    """Texto na fonte 5×5 com contorno, para pontuação. direita: x é a borda direita."""
+    larg = (len(txt) * 6 - 1) * s
+    if direita:
+        x -= larg
+    for n, ch in enumerate(txt):
+        cx = x + n * 6 * s
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1), (1, 1)):
+            tela.letra(ch, cx + dx, y + dy, s, contorno)
+        tela.letra(ch, cx, y, s, cor)
+    return larg
+
+
+def tela_pequena(tela):
+    tela.ceu([(0, (20, 10, 40)), (1, (60, 20, 70))])
+    tela.texto(tela.rows // 2 - 1, "AUMENTE O TERMINAL", (255, 220, 120))
+    tela.texto(tela.rows // 2, f"{tela.cols}x{tela.rows} -> mínimo {TAM_MIN[0]}x{TAM_MIN[1]}", (255, 255, 255))
+    tela.texto(tela.rows // 2 + 1, "(ou diminua a fonte: Ctrl -)", (180, 180, 210))
+
+
+# ======================================================================== jogos: Pulo do Gato
+CHAO = MUNDO_H * 0.8
+METRO = 4.0                     # unidades do mundo por metro
+G_SUB, G_DESC = 270.0, 440.0    # gravidade maior na descida: o pulo não flutua
+PULO, VY_MAX = -100.0, 160.0
+COYOTE = BUFFER = 0.1
+V0, VMAX, ACEL = 34.0, 66.0, 32.0 / 24000
+AR = -PULO / G_SUB + math.sqrt(2 * (PULO * PULO / (2 * G_SUB)) / G_DESC)  # tempo no ar de um pulo inteiro
+ALTURA_PULO = PULO * PULO / (2 * G_SUB)
+
+
+def vel_gato(x):
+    return min(VMAX, V0 + max(0.0, x) * ACEL)
+
+
+def alcance(x):
+    """Distância horizontal de um pulo inteiro, do chão ao chão, na velocidade de x."""
+    return vel_gato(x) * AR
+
+
+class Fase:
+    """Fase do corredor, gerada sob demanda a partir de pedaços pré-desenhados.
+
+    Cada pedaço tem dificuldade e largura medidas em alcances de pulo na velocidade
+    do lugar, e entre pedaços sempre sobra chão para pousar e pular de novo."""
+
+    BALDE = 32.0
+
+    def __init__(self, semente):
+        self.rng = random.Random(semente)
+        self.buracos, self.caixas, self.plataformas, self.novelos = {}, {}, {}, {}
+        self.fim = 0.0
+        self._por(self.novelos, 40, (40.0, CHAO - 4, [False]))
+        self.fim = 110.0  # começo sempre plano
+        self.historico = []  # (x, pedaço): para depurar e testar o gerador
+
+    def _por(self, onde, x, item, larg=0.0):
+        for b in range(int(x // self.BALDE), int((x + larg) // self.BALDE) + 1):
+            onde.setdefault(b, []).append(item)
+
+    def perto(self, onde, x0, x1):
+        vistos = []
+        for b in range(int(x0 // self.BALDE) - 1, int(x1 // self.BALDE) + 1):
+            for item in onde.get(b, ()):
+                if item not in vistos:
+                    vistos.append(item)
+        return vistos
+
+    def buraco(self, x, w):
+        self._por(self.buracos, x, (x, x + w), w)
+
+    def caixa(self, x, alt, w=8.0):
+        self._por(self.caixas, x, (x, CHAO - alt, w), w)
+
+    def plataforma(self, x, y, w):
+        self._por(self.plataformas, x, (x, y, w), w)
+
+    def fileira(self, x, y, n, passo=4.5):
+        for k in range(n):
+            self._por(self.novelos, x + k * passo, (x + k * passo, y, [False]))
+
+    def arco(self, x, w, alt):
+        """Novelos na parábola de um pulo que atravessa [x, x+w]."""
+        for k in range(3):
+            q = (k + 1) / 4
+            self._por(self.novelos, x + w * q, (x + w * q - 1.5, CHAO - 5 - alt * 4 * q * (1 - q), [False]))
+
+    def garantir(self, ate):
+        while self.fim < ate:
+            self._pedaco()
+
+    def _pedaco(self):
+        r, x = self.rng, self.fim
+        R = alcance(x)
+        d = min(1.0, x / 30000)
+        pedacos = [
+            (0.0, self._buraco_curto), (0.0, self._caixa), (0.15, self._duas_caixas),
+            (0.25, self._caixa_alta), (0.35, self._buraco_longo), (0.45, self._degraus),
+            (0.5, self._plataforma), (0.7, self._buraco_e_caixa),
+        ]
+        opcoes = [f for dif, f in pedacos if dif <= d + 0.2]
+        pesos = [1 + 2 * k / len(opcoes) * d for k in range(len(opcoes))]
+        f = r.choices(opcoes, pesos)[0]
+        largura, sobra = f(x, R, r)
+        self.historico.append((x, f.__name__))
+        # chão livre depois do pedaço: o quanto o pulo forçado passa do fim do pedaço
+        # (sobra) mais espaço para pousar e ter tempo de pular de novo
+        livre = sobra + R * (0.9 + r.random() * 0.7 * (1.1 - d))
+        if r.random() < 0.35:
+            self.fileira(x + largura + livre * 0.25, CHAO - 4, r.randint(2, 4))
+        self.fim = x + largura + livre
+
+    @staticmethod
+    def alcance_de_cima(x, alt):
+        """Distância de um pulo que sai de `alt` acima do chão e cai no chão."""
+        return vel_gato(x) * (-PULO / G_SUB + math.sqrt(2 * (ALTURA_PULO + alt) / G_DESC))
+
+    def sobra_caixa(self, x, alt):
+        # pior caso: pular de cima da caixa na beirada
+        return max(0.0, self.alcance_de_cima(x, alt) - Gato.W)
+
+    def _buraco_curto(self, x, R, r):
+        w = max(7.0, R * r.uniform(0.3, 0.45))
+        self.buraco(x, w)
+        if r.random() < 0.5:
+            self.arco(x, w, ALTURA_PULO)
+        return w, 0.0
+
+    def _buraco_longo(self, x, R, r):
+        w = R * r.uniform(0.5, 0.62)
+        self.buraco(x, w)
+        self.arco(x, w, ALTURA_PULO)
+        return w, 0.0
+
+    def _caixa(self, x, R, r):
+        self.caixa(x, 7)
+        return 8.0, self.sobra_caixa(x, 7)
+
+    def _caixa_alta(self, x, R, r):
+        self.caixa(x, 13)
+        if r.random() < 0.5:
+            self.fileira(x + 1.5, CHAO - 17, 1)
+        return 8.0, self.sobra_caixa(x, 13)
+
+    def _duas_caixas(self, x, R, r):
+        self.caixa(x, 7)
+        if r.random() < 0.5:
+            self.caixa(x + 8, 7)  # caixa dupla, larga: dá para pousar em cima
+            return 16.0, self.sobra_caixa(x, 7)
+        vao = self.sobra_caixa(x, 7) + R * r.uniform(0.9, 1.1)
+        self.caixa(x + 8 + vao, 7)
+        return 16.0 + vao, self.sobra_caixa(x, 7)
+
+    def _degraus(self, x, R, r):
+        self.caixa(x, 7)
+        self.caixa(x + 8, 13)
+        self.fileira(x + 9.5, CHAO - 17, 1)
+        return 16.0, self.sobra_caixa(x, 13)
+
+    def _plataforma(self, x, R, r):
+        w = R * r.uniform(1.1, 1.35)
+        pw = r.uniform(14, 20)
+        alt = r.uniform(8, 12)
+        self.buraco(x, w)
+        self.plataforma(x + (w - pw) / 2, CHAO - alt, pw)
+        self.fileira(x + (w - pw) / 2 + 2, CHAO - alt - 4, int(pw // 5))
+        return w, max(0.0, self.alcance_de_cima(x, alt) - (w - pw) / 2)
+
+    def _buraco_e_caixa(self, x, R, r):
+        w = R * r.uniform(0.3, 0.42)
+        self.buraco(x, w)
+        vao = R * r.uniform(1.0, 1.2)
+        self.caixa(x + w + vao, 7)
+        return w + vao + 8, self.sobra_caixa(x, 7)
+
+    def no_buraco(self, a, b):
+        """O trecho [a, b] está todo em cima de um buraco?"""
+        return any(x0 <= a and b <= x1 for x0, x1 in self.perto(self.buracos, a, b))
+
+    def apoio(self, a, b, y0, y1):
+        """Topo mais alto entre y0 e y1 que sustenta o trecho [a, b], ou None."""
+        topos = []
+        if y0 - 0.01 <= CHAO <= y1 and not self.no_buraco(a, b):
+            topos.append(CHAO)
+        for bx, top, bw in self.perto(self.caixas, a, b):
+            if bx < b and a < bx + bw and y0 - 0.01 <= top <= y1:
+                topos.append(top)
+        for px, py, pw in self.perto(self.plataformas, a, b):
+            if px < b and a < px + pw and y0 - 0.01 <= py <= y1:
+                topos.append(py)
+        return min(topos) if topos else None
+
+
+class Gato:
+    """Física do gato: só números, para o jogo e o teste de alcançabilidade usarem a mesma."""
+
+    __slots__ = ("x", "y", "vy", "chao", "coyote", "buffer", "cortou", "morto")
+    W, H = 9.0, 7.0
+
+    def __init__(self, x=20.0):
+        self.x, self.y, self.vy = x, CHAO, 0.0
+        self.chao, self.coyote, self.buffer, self.cortou, self.morto = True, 0.0, 0.0, False, None
+
+    def copia(self):
+        g = Gato.__new__(Gato)
+        for k in Gato.__slots__:
+            setattr(g, k, getattr(self, k))
+        return g
+
+    def passo(self, dt, fase, apertou, soltou, variavel):
+        """Avança um passo. Devolve "pulou", "pousou", "morreu" ou None."""
+        ev = None
+        self.buffer = BUFFER if apertou else max(0.0, self.buffer - dt)
+        self.coyote = COYOTE if self.chao else max(0.0, self.coyote - dt)
+        if self.buffer > 0 and self.coyote > 0:
+            self.vy, self.chao, self.coyote, self.buffer, self.cortou = PULO, False, 0.0, 0.0, False
+            ev = "pulou"
+        if variavel and soltou and self.vy < 0 and not self.cortou:
+            self.vy *= 0.5
+            self.cortou = True
+        nx = self.x + vel_gato(self.x) * dt
+        for bx, top, bw in fase.perto(fase.caixas, nx, nx + self.W):
+            if nx + self.W - 1.2 > bx and nx + 1.2 < bx + bw and self.y > top:
+                if self.y > top + 1.5:
+                    self.morto = "bateu"
+                    return "morreu"
+                self.y = top  # degrau baixo: sobe em vez de bater
+        self.x = nx
+        g = G_SUB if self.vy < 0 else G_DESC
+        self.vy = min(self.vy + g * dt, VY_MAX)
+        ny = self.y + self.vy * dt
+        topo = fase.apoio(self.x + 2, self.x + self.W - 2, self.y, ny) if self.vy >= 0 else None
+        if topo is not None:
+            if not self.chao:
+                ev = "pousou"
+            self.y, self.vy, self.chao = topo, 0.0, True
+        else:
+            self.y, self.chao = ny, False
+        if self.y > CHAO + 4:
+            self.morto = "caiu"
+            return "morreu"
+        return ev
+
+
+class PuloDoGato(Jogo):
+    nome, titulo, abertura = "gato", "Pulo do Gato", "gato"
+    dicas = "espaço/↑ pula   p pausa   q sai"
+
+    def iniciar(self, semente):
+        super().iniciar(semente)
+        self.fase = Fase(semente)
+        self.gato = Gato()
+        self.cam = Camera()
+        self.part = Particulas(200)
+        self.novelos = 0
+        self.morreu_em = None
+        self.squash = 0.0   # >0 achatado (pouso), <0 esticado (pulo)
+        self.flash = 0.0
+        self.passos = 0
+
+    def metros(self):
+        return int(self.gato.x / METRO)
+
+    def pontos(self):
+        return self.metros() + 25 * self.novelos
+
+    def atualizar(self, dt, ent):
+        super().atualizar(dt, ent)
+        g = self.gato
+        self.fase.garantir(g.x + 400)
+        self.part.atualizar(dt)
+        self.cam.atualizar(dt, self.rng)
+        self.flash = max(0.0, self.flash - dt * 2.5)
+        self.squash *= 0.8
+        if self.morreu_em is not None:
+            g.vy += G_DESC * dt
+            g.y += g.vy * dt
+            return "fim" if self.t - self.morreu_em > 1.6 else None
+        variavel = ent.modo != "fallback"
+        ev = g.passo(dt, self.fase, ent.apertou("pular"), ent.soltou("pular"), variavel)
+        if ev == "pulou":
+            self.squash = -1.0
+            self.part.explodir(self.rng, g.x + 3, CHAO if g.y >= CHAO - 0.1 else g.y, 5, 14, 0.35,
+                               [(230, 210, 170), (200, 180, 140)], grav=-10, tam=0.9, cone=(math.pi, 2 * math.pi))
+        elif ev == "pousou":
+            self.squash = 1.0
+            for lado in (-1, 1):
+                self.part.explodir(self.rng, g.x + 4.5 + lado * 3, g.y - 0.5, 4, 16, 0.4,
+                                   [(230, 210, 170), (200, 180, 140)], grav=20, tam=0.9,
+                                   cone=(math.pi * (1.1 if lado < 0 else 1.6), math.pi * (1.4 if lado < 0 else 1.9)))
+        elif ev == "morreu":
+            self.morreu_em = self.t
+            g.vy = -90.0
+            self.cam.tremer(1.2)
+            self.flash = 1.0
+            self.part.explodir(self.rng, g.x + 4.5, g.y - 3, 24, 40, 0.8,
+                               [(255, 255, 255), (255, 200, 120), (240, 146, 62)], grav=60, tam=1.2)
+        if g.chao and g.vy == 0 and int(self.t * 30) % 6 == 0:
+            self.part.emitir(g.x + 1, g.y - 0.5, -10 - self.rng.random() * 8, -6, 0.3, (220, 200, 160), grav=20, tam=0.6)
+        for x, y, pego in self.fase.perto(self.fase.novelos, g.x, g.x + g.W):
+            if not pego[0] and colide((g.x, g.y - g.H, g.W, g.H), (x, y, 3.5, 3.5), folga=0.0):
+                pego[0] = True
+                self.novelos += 1
+                self.part.explodir(self.rng, x + 1.7, y + 1.7, 10, 22, 0.5,
+                                   [(255, 160, 200), (255, 255, 255), (255, 220, 120)], tam=0.8)
+        return None
+
+    def ceu(self):
+        """Hora do dia pela distância: dia, pôr do sol, noite e aurora a cada 500 m."""
+        ciclo = [CEU_DIA, CEU_POR, CEU_NOITE, CEU_AURORA]
+        m = self.gato.x / METRO
+        i = int(m // 500)
+        p = max(0.0, (m % 500 - 460) / 40)
+        p = round(p * 8) / 8  # poucos degraus de transição: o céu continua no cache
+        a, b = ciclo[i % 4], ciclo[(i + 1) % 4]
+        if p <= 0:
+            return a, 1.0 if a is CEU_NOITE else 0.0
+        pos = [0, 0.3, 0.6, 1]
+        ceu = [(q, lerp_cor(cor_em(a, q), cor_em(b, q), p)) for q in pos]
+        noite = (1 - p if a is CEU_NOITE else 0.0) + (p if b is CEU_NOITE else 0.0)
+        return ceu, noite
+
+    def desenhar(self, tela):
+        cam, g = self.cam, self.gato
+        cam.ajustar(tela)
+        cam.x = g.x - 16 if self.morreu_em is None else cam.x
+        e = cam.escala
+        gy = cam.ty(CHAO)
+        ceu, noite = self.ceu()
+        off = cam.x * e
+        colinas(tela, off, gy, ceu, noite)
+        if noite > 0.3:
+            tela.brilho(tela.W * 0.8, tela.H * 0.2, tela.H * 0.2, (200, 210, 255), 0.3 * noite)
+            tela.circulo(tela.W * 0.8, tela.H * 0.2, max(2, tela.H * 0.06), lerp_cor((255, 250, 220), (235, 235, 220), noite))
+        else:
+            tela.brilho(tela.W * 0.82, tela.H * 0.16, tela.H * 0.25, (255, 250, 210), 0.5)
+        x0, x1 = cam.x - 10, cam.x + cam.largura_visivel() + 10
+        buracos = [(cam.tx(a), cam.tx(b)) for a, b in self.fase.perto(self.fase.buracos, x0, x1)]
+        chao_tijolos(tela, gy, off, e, buracos)
+        for px, py, pw in self.fase.perto(self.fase.plataformas, x0, x1):
+            sx, sy, sw = cam.tx(px), cam.ty(py), cam.px(pw)
+            tela.retangulo(sx, sy, sx + sw, sy + max(2, e * 2.2), (150, 92, 44))
+            tela.retangulo(sx, sy, sx + sw, sy + max(1, e * 0.6), (200, 146, 80))
+            tela.retangulo(sx, sy + max(2, e * 2.2) - 1, sx + sw, sy + max(2, e * 2.2), (80, 44, 20))
+        for bx, top, bw in self.fase.perto(self.fase.caixas, x0, x1):
+            alt = CHAO - top
+            n = int(round(alt / 7)) if alt > 7.5 else 1
+            for k in range(n):
+                tela.desenhar(caixa(cam.px(bw), cam.px(alt / n)), cam.tx(bx), cam.ty(top + k * alt / n))
+        hn = cam.px(3.5)
+        for x, y, pego in self.fase.perto(self.fase.novelos, x0, x1):
+            if not pego[0]:
+                bob = math.sin(self.t * 4 + x) * e * 0.6
+                tela.brilho(cam.tx(x) + hn / 2, cam.ty(y) + hn / 2 + bob, hn * 1.2, (255, 190, 220), 0.35)
+                tela.desenhar(novelo(hn), cam.tx(x), cam.ty(y) + bob)
+        self._desenhar_gato(tela)
+        self.part.desenhar(tela, cam)
+        self._hud(tela)
+        if self.flash > 0:
+            tela.flash(min(1.0, self.flash) * 0.8)
+
+    def _desenhar_gato(self, tela):
+        cam, g = self.cam, self.gato
+        h = cam.px(10)
+        if self.morreu_em is not None:
+            spr = gato(h, 4, "normal", morto=True)
+        else:
+            forma = "achatado" if self.squash > 0.35 else "esticado" if self.squash < -0.35 or g.vy < -40 else "normal"
+            spr = gato(h, int(self.t * 14) % 4 if g.chao else 4, forma)
+        if g.y <= CHAO + 0.1 and not self.fase.no_buraco(g.x + 2, g.x + g.W - 2):
+            alt = max(0.0, CHAO - g.y)
+            tela.sombra(cam.tx(g.x + 4.5), cam.ty(CHAO) + 1, cam.px(4.5) / (1 + alt * 0.08), max(1, cam.px(0.8)))
+        # o sprite (1,5h de largura) é centralizado na caixa de colisão (W de largura)
+        tela.desenhar(spr, cam.tx(g.x + g.W / 2) - spr.w * 0.55, cam.ty(g.y) - spr.h + 1)
+
+    def _hud(self, tela):
+        s = 1 if tela.H < 90 else 2
+        hud_texto(tela, f"{self.pontos():06d}", 2, 2, s, (255, 230, 140))
+        hud_texto(tela, f"{self.metros()}M", 2, 3 + 6 * s, s, (255, 255, 255))
+        larg = hud_texto(tela, f"{self.novelos:03d}", tela.W - 2, 2, s, (255, 200, 225), direita=True)
+        tela.desenhar(novelo(5 * s), tela.W - 2 - larg - 7 * s, 2)
+        if self.t < 4:
+            tela.texto(tela.rows - 1, self.dicas, (255, 255, 255))
+
+
+# ======================================================================== jogos: Tocha Eterna
+PAREDE, PISO = 0, 1
+DIRECOES = {"cima": (0, -1), "baixo": (0, 1), "esquerda": (-1, 0), "direita": (1, 0)}
+INIMIGOS = {
+    # tipo: (vida, dano, pontos)
+    "gosma": (2, 1, 50),     # persegue
+    "vulto": (1, 1, 80),     # foge da luz, ataca no escuro
+    "pedrusco": (3, 1, 120),  # lento: só se mexe a cada dois turnos
+}
+
+
+class Andar:
+    """Um andar da masmorra gerado por BSP: divide a área, põe uma sala em cada folha
+    e liga as salas irmãs com corredores em L. A escada fica na sala mais longe da entrada."""
+
+    def __init__(self, semente, numero, largura=40, altura=28):
+        self.rng = random.Random(semente * 1009 + numero)
+        self.numero, self.W, self.H = numero, largura, altura
+        self.grade = [[PAREDE] * largura for _ in range(altura)]
+        self.salas = []
+        self._dividir(1, 1, largura - 2, altura - 2, 0)
+        self.entrada = self._centro(self.salas[0])
+        dist = self.distancias(self.entrada)
+        self.escada = max(((x, y) for x, y in dist if self._em_sala(x, y)), key=lambda p: (dist[p], p))
+        self.itens, self.inimigos = {}, []
+        self._povoar(dist)
+
+    def _dividir(self, x, y, w, h, nivel):
+        r = self.rng
+        if (w < 16 and h < 12) or nivel > 4:
+            rw = r.randint(4, max(4, min(w - 2, 10)))
+            rh = r.randint(3, max(3, min(h - 2, 7)))
+            rx, ry = x + r.randint(1, max(1, w - rw - 1)), y + r.randint(1, max(1, h - rh - 1))
+            sala = (rx, ry, rw, rh)
+            for yy in range(ry, ry + rh):
+                for xx in range(rx, rx + rw):
+                    self.grade[yy][xx] = PISO
+            self.salas.append(sala)
+            return [sala]
+        if w / h > 1.25 or (h / w <= 1.25 and r.random() < 0.5 and w >= 16):
+            corte = r.randint(int(w * 0.38), int(w * 0.62))
+            a = self._dividir(x, y, corte, h, nivel + 1)
+            b = self._dividir(x + corte, y, w - corte, h, nivel + 1)
+        else:
+            corte = r.randint(int(h * 0.38), int(h * 0.62))
+            a = self._dividir(x, y, w, corte, nivel + 1)
+            b = self._dividir(x, y + corte, w, h - corte, nivel + 1)
+        self._corredor(self._centro(r.choice(a)), self._centro(r.choice(b)))
+        return a + b
+
+    @staticmethod
+    def _centro(sala):
+        x, y, w, h = sala
+        return (x + w // 2, y + h // 2)
+
+    def _em_sala(self, x, y):
+        return any(sx <= x < sx + sw and sy <= y < sy + sh for sx, sy, sw, sh in self.salas)
+
+    def _corredor(self, a, b):
+        (x0, y0), (x1, y1) = a, b
+        if self.rng.random() < 0.5:
+            x0, y0, x1, y1 = x1, y1, x0, y0
+        for x in range(min(x0, x1), max(x0, x1) + 1):
+            self.grade[y0][x] = PISO
+        for y in range(min(y0, y1), max(y0, y1) + 1):
+            self.grade[y][x1] = PISO
+
+    def livre(self, x, y):
+        return 0 <= x < self.W and 0 <= y < self.H and self.grade[y][x] == PISO
+
+    def distancias(self, origem):
+        """Distância em passos (BFS) de origem até cada piso alcançável."""
+        dist, fila = {origem: 0}, [origem]
+        for x, y in fila:
+            for dx, dy in DIRECOES.values():
+                p = (x + dx, y + dy)
+                if p not in dist and self.livre(*p):
+                    dist[p] = dist[(x, y)] + 1
+                    fila.append(p)
+        return dist
+
+    def _povoar(self, dist):
+        r, n = self.rng, self.numero
+        longe = sorted(p for p, d in dist.items() if d >= 5 and p != self.escada)
+        r.shuffle(longe)
+        for tipo, qtd in (("oleo", 3), ("cristal", 3 + n // 2), ("coracao", 1)):
+            for _ in range(qtd):
+                if longe:
+                    self.itens[longe.pop()] = tipo
+        tipos = ["gosma"] * 3 + ["vulto"] * (2 if n >= 2 else 0) + ["pedrusco"] * (2 if n >= 3 else 1)
+        for _ in range(min(len(longe), 2 + n)):
+            x, y = longe.pop()
+            tipo = r.choice(tipos)
+            self.inimigos.append(Criatura(tipo, x, y, INIMIGOS[tipo][0]))
+
+    def visiveis(self, origem, raio):
+        """Campo de visão: raycast de Bresenham até cada célula dentro do raio."""
+        ox, oy = origem
+        vis = {origem}
+        R = int(math.ceil(raio))
+        for y in range(oy - R, oy + R + 1):
+            for x in range(ox - R, ox + R + 1):
+                if (x - ox) ** 2 + (y - oy) ** 2 > raio * raio or not (0 <= x < self.W and 0 <= y < self.H):
+                    continue
+                if self._linha_livre(ox, oy, x, y):
+                    vis.add((x, y))
+        return vis
+
+    def _linha_livre(self, x0, y0, x1, y1):
+        dx, dy = abs(x1 - x0), -abs(y1 - y0)
+        sx, sy = (1 if x1 > x0 else -1), (1 if y1 > y0 else -1)
+        erro = dx + dy
+        x, y = x0, y0
+        while (x, y) != (x1, y1):
+            if (x, y) != (x0, y0) and self.grade[y][x] == PAREDE:
+                return False
+            e2 = 2 * erro
+            if e2 >= dy:
+                erro += dy
+                x += sx
+            if e2 <= dx:
+                erro += dx
+                y += sy
+        return True
+
+
+class Criatura:
+    __slots__ = ("tipo", "x", "y", "vida", "ax", "ay", "t_mov", "turnos", "t_dano")
+
+    def __init__(self, tipo, x, y, vida):
+        self.tipo, self.x, self.y, self.vida = tipo, x, y, vida
+        self.ax, self.ay, self.t_mov, self.turnos, self.t_dano = x, y, -1.0, 0, -1.0
+
+    def mover(self, x, y, agora):
+        self.ax, self.ay = self.x, self.y
+        self.x, self.y, self.t_mov = x, y, agora
+
+    def pos_desenho(self, agora, dur=0.1):
+        """Posição interpolada entre o turno anterior e o atual: nada de teletransporte."""
+        q = ease(min(1.0, (agora - self.t_mov) / dur))
+        return lerp(self.ax, self.x, q), lerp(self.ay, self.y, q)
+
+
+@functools.lru_cache(maxsize=64)
+def gosma(h, fase=0):
+    h = max(4, int(h))
+    w = int(h * 1.2)
+    s = Spr(w, h)
+    sq = [0, 0.06, 0, -0.06][fase % 4]
+    s.elipse(w * 0.5, h * (0.62 + sq / 2), w * (0.46 + sq), h * (0.36 - sq),
+             [(30, 100, 40), (60, 160, 60), (110, 210, 90), (190, 250, 160)])
+    s.contorno((14, 50, 20))
+    for ex in (0.36, 0.6):
+        s.px[(int(w * ex), int(h * 0.56))] = (14, 30, 14)
+    return s
+
+
+@functools.lru_cache(maxsize=64)
+def vulto(h, fase=0):
+    h = max(4, int(h))
+    w = int(h * 0.9)
+    s = Spr(w, h)
+    rampa = [(16, 10, 30), (34, 22, 58), (56, 40, 90)]
+    s.elipse(w * 0.5, h * 0.36, w * 0.36, h * 0.3, rampa)
+    for k in range(3):
+        x = w * (0.22 + 0.28 * k) + [0, 1, 0, -1][(fase + k) % 4] * 0.5
+        s.poligono([(x - w * 0.12, h * 0.5), (x + w * 0.12, h * 0.5), (x, h * 0.98)], rampa)
+    s.contorno((6, 2, 12))
+    for ex in (0.36, 0.62):
+        s.px[(int(w * ex), int(h * 0.34))] = (255, 60, 80)
+    return s
+
+
+@functools.lru_cache(maxsize=64)
+def pedrusco(h, fase=0):
+    h = max(4, int(h))
+    w = int(h * 1.05)
+    s = Spr(w, h)
+    pedra = [(60, 56, 62), (100, 94, 100), (140, 134, 138), (180, 176, 176)]
+    s.poligono([(w * 0.12, h * 0.3), (w * 0.4, h * 0.06), (w * 0.82, h * 0.14), (w * 0.96, h * 0.6),
+                (w * 0.8, h * 0.98), (w * 0.18, h * 0.98), (w * 0.02, h * 0.66)], pedra)
+    s.contorno((26, 22, 28))
+    s.linha(w * 0.3, h * 0.7, w * 0.5, h * 0.62, (60, 56, 62))
+    for ex in (0.36, 0.64):
+        s.px[(int(w * ex), int(h * 0.42))] = (255, 170, 60) if fase % 2 == 0 else (200, 110, 40)
+    return s
+
+
+@functools.lru_cache(maxsize=16)
+def frasco(h):
+    h = max(3, int(h))
+    w = max(3, int(h * 0.7))
+    s = Spr(w, h)
+    s.ret(w * 0.36, 0, w * 0.64 + 1, h * 0.25, (120, 80, 50))
+    s.elipse(w * 0.5, h * 0.62, w * 0.46, h * 0.36, [(150, 80, 10), (220, 140, 30), (255, 200, 80), (255, 240, 170)])
+    s.contorno((50, 28, 8))
+    return s
+
+
+@functools.lru_cache(maxsize=16)
+def coracao(h):
+    h = max(3, int(h))
+    s = Spr(h, h)
+    rampa = [(150, 20, 40), (220, 50, 70), (255, 120, 130), (255, 210, 210)]
+    s.elipse(h * 0.3, h * 0.35, h * 0.26, h * 0.24, rampa)
+    s.elipse(h * 0.7, h * 0.35, h * 0.26, h * 0.24, rampa)
+    s.poligono([(h * 0.05, h * 0.42), (h * 0.95, h * 0.42), (h * 0.5, h * 0.95)], rampa)
+    s.contorno((70, 10, 20))
+    return s
+
+
+@functools.lru_cache(maxsize=1024)
+def ladrilho(tipo, T, var, luz, estilo, frente=False):
+    """Linhas de pixels de uma célula já iluminada (luz 0-8) e convertida para o estilo."""
+    linhas = []
+    for y in range(T):
+        linha = []
+        for x in range(T):
+            if tipo == PAREDE:
+                tw, th = max(2, T // 2), max(2, T // 3)
+                fila = y // th
+                junta = y % th == th - 1 or (x + (fila % 2) * (tw // 2) + var) % tw == 0
+                c = (40, 36, 54) if junta else (96, 92, 120) if _hash(x // tw + var, fila + var) > 0.6 else (78, 74, 100)
+                if frente and y >= T * 0.6:
+                    c = escurecer(c, 0.35)
+            elif tipo == "escada":
+                degrau = y * 4 // T
+                c = escurecer((120, 104, 90), degrau * 0.2) if x % max(2, T // 4) else (40, 30, 30)
+            else:
+                borda = x == 0 or y == 0
+                c = (52, 46, 58) if borda else (84, 76, 88) if _hash(x + var * 13, y + var * 7) > 0.85 else (70, 64, 76)
+            if luz == 0:  # lembrado, fora da luz: escuro e azulado
+                c = lerp_cor((4, 4, 12), lerp_cor(c, (60, 70, 120), 0.5), 0.28)
+            elif luz < 8:
+                c = lerp_cor((3, 2, 8), c, 0.3 + 0.7 * (luz / 8) ** 1.2)
+            else:
+                c = lerp_cor(c, (255, 190, 120), 0.12)
+            linha.append(conv(c, estilo))
+        linhas.append(linha)
+    return linhas
+
+
+class CamGrade:
+    """Câmera em células da masmorra (para partículas e sprites)."""
+
+    def __init__(self, T, cx, cy, W, H):
+        self.T, self.cx, self.cy, self.W, self.H = T, cx, cy, W, H
+
+    def tx(self, x):
+        return (x - self.cx) * self.T + self.W / 2
+
+    def ty(self, y):
+        return (y - self.cy) * self.T + self.H / 2
+
+    def px(self, w):
+        return w * self.T
+
+
+class TochaEterna(Jogo):
+    nome, titulo, abertura = "tocha", "Tocha Eterna", "tocha"
+    dicas = "setas/wasd anda e ataca   espaço espera   p pausa   q sai"
+    COMBUSTIVEL = 100
+    CONSUMO = 0.5  # por turno
+    VIDA = 6
+
+    def iniciar(self, semente):
+        super().iniciar(semente)
+        self.vida, self.oleo, self.cristais, self.abatidos = self.VIDA, float(self.COMBUSTIVEL), 0, []
+        self.part = Particulas(160)
+        self.msg, self.t_msg = "", -9.0
+        self.morreu_em = None
+        self.t_dano = -9.0
+        self.ultimo_turno = -9.0
+        self.turno = 0
+        self.novo_andar(1)
+
+    def novo_andar(self, numero):
+        self.andar = Andar(self.semente, numero)
+        self.heroi = Criatura("heroi", *self.andar.entrada, self.vida)
+        self.explorado = set()
+        self.t_andar = self.t
+        self._ver()
+
+    def raio(self):
+        return 1.5 if self.oleo <= 0 else 2.2 + 5.8 * self.oleo / self.COMBUSTIVEL
+
+    def _ver(self):
+        self.visivel = self.andar.visiveis((self.heroi.x, self.heroi.y), self.raio())
+        self.explorado |= self.visivel
+
+    def pontos(self):
+        return 100 * self.cristais + sum(INIMIGOS[t][2] for t in self.abatidos) + 250 * (self.andar.numero - 1)
+
+    def avisar(self, msg):
+        self.msg, self.t_msg = msg, self.t
+
+    def atualizar(self, dt, ent):
+        super().atualizar(dt, ent)
+        self.part.atualizar(dt)
+        if self.oleo > 0 and self.rng.random() < 0.3:
+            h = self.heroi
+            self.part.emitir(h.x + 0.5 + (self.rng.random() - 0.5) * 0.3, h.y - 0.2, (self.rng.random() - 0.5) * 0.6,
+                             -1.2 - self.rng.random(), 0.6, (255, 170, 70), tam=0.08)
+        if self.morreu_em is not None:
+            return "fim" if self.t - self.morreu_em > 1.8 else None
+        if self.t - self.ultimo_turno < 0.09:  # uma ação por animação, mesmo segurando a tecla
+            return None
+        for acao, (dx, dy) in DIRECOES.items():
+            if ent.apertou(acao, repetir=True):
+                self._turno(dx, dy)
+                return None
+        if ent.apertou("acao", repetir=True):
+            self._turno(0, 0)
+        return None
+
+    def _turno(self, dx, dy):
+        h, a = self.heroi, self.andar
+        self.ultimo_turno = self.t
+        self.turno += 1
+        nx, ny = h.x + dx, h.y + dy
+        alvo = next((c for c in a.inimigos if (c.x, c.y) == (nx, ny)), None)
+        if dx == dy == 0:
+            pass
+        elif alvo:
+            self._ferir(alvo, 1)
+            h.mover(h.x, h.y, self.t)
+        elif a.livre(nx, ny):
+            h.mover(nx, ny, self.t)
+        else:
+            return
+        antes, self.oleo = self.oleo, max(0.0, self.oleo - self.CONSUMO)
+        if antes > 0 and self.oleo == 0:
+            self.avisar("A tocha apagou!")
+        self._pegar()
+        if (h.x, h.y) == a.escada:
+            self.oleo = min(self.COMBUSTIVEL, self.oleo + 15)
+            self.novo_andar(a.numero + 1)
+            self.avisar(f"Andar {self.andar.numero}. Mais fundo...")
+            return
+        self._inimigos()
+        self._ver()
+
+    def _pegar(self):
+        h, a = self.heroi, self.andar
+        item = a.itens.pop((h.x, h.y), None)
+        cores = {"oleo": [(255, 200, 80), (255, 140, 40)], "cristal": [(150, 220, 255), (255, 255, 255)],
+                 "coracao": [(255, 120, 130), (255, 220, 220)]}
+        if item:
+            self.part.explodir(self.rng, h.x + 0.5, h.y + 0.5, 12, 3.0, 0.6, cores[item], tam=0.12)
+        if item == "oleo":
+            self.oleo = min(self.COMBUSTIVEL, self.oleo + 40)
+            self.avisar("Óleo! A tocha reacende.")
+        elif item == "cristal":
+            self.cristais += 1
+            self.avisar("Um cristal azul!")
+        elif item == "coracao":
+            self.vida = min(self.VIDA, self.vida + 1)
+            self.avisar("Você se sente melhor.")
+
+    def _ferir(self, c, dano):
+        c.vida -= dano
+        c.t_dano = self.t
+        self.part.explodir(self.rng, c.x + 0.5, c.y + 0.5, 6, 2.5, 0.3, [(255, 255, 255), (255, 200, 120)], tam=0.1)
+        if c.vida <= 0:
+            self.andar.inimigos.remove(c)
+            self.abatidos.append(c.tipo)
+            cor = {"gosma": (110, 210, 90), "vulto": (120, 80, 170), "pedrusco": (150, 140, 140)}[c.tipo]
+            self.part.explodir(self.rng, c.x + 0.5, c.y + 0.5, 16, 3.5, 0.7, [cor, clarear(cor, 0.4)], grav=4, tam=0.14)
+            self.avisar(f"{c.tipo.capitalize()} derrotado!")
+
+    def _inimigos(self):
+        h, a = self.heroi, self.andar
+        dist = a.distancias((h.x, h.y))
+        ocupado = {(c.x, c.y) for c in a.inimigos}
+        luz = self.visivel if self.oleo > 0 else set()
+        for c in list(a.inimigos):
+            c.turnos += 1
+            d = dist.get((c.x, c.y), 99)
+            if d > 9:
+                continue  # longe demais: dorme
+            if c.tipo == "pedrusco" and c.turnos % 2:
+                continue
+            if d == 1 and not (c.tipo == "vulto" and (c.x, c.y) in luz):
+                self._atacado(c)
+                continue
+            fugir = c.tipo == "vulto" and (c.x, c.y) in luz
+            opcoes = []
+            for dx, dy in DIRECOES.values():
+                p = (c.x + dx, c.y + dy)
+                if p in dist and p not in ocupado and p != (h.x, h.y):
+                    opcoes.append((-dist[p] if fugir else dist[p], p))
+            if opcoes:
+                melhor, p = min(opcoes)
+                atual = -d if fugir else d
+                if melhor < atual:
+                    ocupado.discard((c.x, c.y))
+                    c.mover(*p, self.t)
+                    ocupado.add(p)
+
+    def _atacado(self, c):
+        dano = INIMIGOS[c.tipo][1]
+        self.vida -= dano
+        self.t_dano = self.t
+        c.mover(c.x, c.y, self.t)
+        self.avisar({"gosma": "A gosma te queima!", "vulto": "Algo te arranha no escuro!",
+                     "pedrusco": "O pedrusco te esmaga!"}[c.tipo])
+        self.part.explodir(self.rng, self.heroi.x + 0.5, self.heroi.y + 0.5, 10, 3.0, 0.4,
+                           [(255, 60, 60), (255, 160, 160)], grav=3, tam=0.12)
+        if self.vida <= 0:
+            self.vida = 0
+            self.morreu_em = self.t
+            self.avisar("A chama se apaga para sempre...")
+
+    def desenhar(self, tela):
+        a, h = self.andar, self.heroi
+        T = max(6, min(tela.W // 12, tela.H // 7))
+        hx, hy = h.pos_desenho(self.t)
+        cam = CamGrade(T, hx + 0.5, hy + 0.5, tela.W, tela.H)
+        tela.retangulo(0, 0, tela.W, tela.H, (3, 2, 8))
+        raio = self.raio()
+        tremor = 0.92 + 0.08 * math.sin(self.t * 11) * math.sin(self.t * 7.3)
+        cols = tela.W // T + 3
+        rows = tela.H // T + 3
+        x0, y0 = int(cam.cx - cols / 2), int(cam.cy - rows / 2)
+        apagada = self.oleo <= 0 or self.morreu_em is not None
+        for gy in range(y0, y0 + rows):
+            for gx in range(x0, x0 + cols):
+                if (gx, gy) not in self.explorado:
+                    continue
+                tipo = a.grade[gy][gx]
+                if (gx, gy) == a.escada:
+                    tipo = "escada"
+                if (gx, gy) in self.visivel and not apagada:
+                    d = math.hypot(gx - h.x, gy - h.y) / max(1.0, raio)
+                    luz = max(1, min(8, int(9 * (1 - d * d) * tremor)))
+                else:
+                    luz = 0
+                frente = tipo == PAREDE and gy + 1 < a.H and a.grade[gy + 1][gx] == PISO
+                linhas = ladrilho(tipo, T, (gx * 7 + gy * 3) % 5, luz, tela.estilo, frente)
+                sx, sy = int(cam.tx(gx)), int(cam.ty(gy))
+                for k, linha in enumerate(linhas):
+                    yy = sy + k
+                    if 0 <= yy < tela.H:
+                        a0, b0 = max(0, sx), min(tela.W, sx + T)
+                        if a0 < b0:
+                            tela.px[yy][a0:b0] = linha[a0 - sx:b0 - sx]
+        # itens e criaturas só onde a tocha alcança
+        for (ix, iy), item in a.itens.items():
+            if (ix, iy) in self.visivel and not apagada:
+                bob = math.sin(self.t * 3 + ix) * T * 0.08
+                spr = {"oleo": frasco, "cristal": cristal, "coracao": coracao}[item](T * 0.7)
+                cx, cy = cam.tx(ix + 0.5), cam.ty(iy + 0.5) + bob
+                tela.brilho(cx, cy, T * 0.8, {"oleo": (255, 180, 60), "cristal": (120, 200, 255),
+                                               "coracao": (255, 100, 120)}[item], 0.4)
+                tela.desenhar(spr, cx - spr.w / 2, cy - spr.h / 2)
+        fase = int(self.t * 4)
+        for c in a.inimigos:
+            if (c.x, c.y) not in self.visivel or apagada:
+                continue
+            ex, ey = c.pos_desenho(self.t)
+            spr = {"gosma": gosma, "vulto": vulto, "pedrusco": pedrusco}[c.tipo](T * 1.0, fase)
+            d = math.hypot(c.x - h.x, c.y - h.y) / max(1.0, raio)
+            sombra = min(0.85, max(0.0, d * d))
+            tinta = (255, 255, 255) if self.t - c.t_dano < 0.15 else (0, 0, 0)
+            forca = 0.8 if tinta[0] else sombra
+            sx, sy = cam.tx(ex + 0.5) - spr.w / 2, cam.ty(ey + 1) - spr.h
+            tela.sombra(cam.tx(ex + 0.5), cam.ty(ey + 0.95), T * 0.35, max(1, T * 0.1))
+            tela.desenhar(spr, sx, sy, tinta, forca)
+        self._desenhar_heroi(tela, cam, hx, hy)
+        self.part.desenhar(tela, cam)
+        if not apagada:
+            tela.brilho(tela.W / 2, tela.H / 2 - T * 0.5, T * raio * 0.9 * tremor, (255, 160, 80), 0.18)
+        if self.t - self.t_dano < 0.25:
+            tela.flash(0.35 * (1 - (self.t - self.t_dano) / 0.25), (255, 30, 30))
+        if self.t - self.t_andar < 0.6:
+            tela.flash(1 - (self.t - self.t_andar) / 0.6, (0, 0, 0))
+        self._hud(tela)
+
+    def _desenhar_heroi(self, tela, cam, hx, hy):
+        T = cam.T
+        spr = mago(T * 1.35, int(self.t * 6) % 4 if self.t - self.heroi.t_mov < 0.1 else 0)
+        sx, sy = cam.tx(hx + 0.5) - spr.w / 2, cam.ty(hy + 1) - spr.h
+        if self.morreu_em is not None:
+            q = min(1.0, (self.t - self.morreu_em) / 1.2)
+            tela.desenhar(spr, sx, sy + q * T * 0.3, (0, 0, 0), 0.4 + 0.5 * q)
+            return
+        tela.sombra(cam.tx(hx + 0.5), cam.ty(hy + 0.95), T * 0.4, max(1, T * 0.1))
+        tela.desenhar(spr, sx, sy)
+        if self.oleo > 0:
+            chama(tela, sx + spr.ponta[0], sy + spr.ponta[1], max(1.0, T * 0.18 * (0.6 + 0.4 * self.oleo / 100)),
+                  self.t, 3)
+
+    def _hud(self, tela):
+        s = 1 if tela.H < 90 else 2
+        for k in range(self.VIDA):
+            c = coracao(5 * s)
+            tela.desenhar(c, 2 + k * 6 * s, 2, None if k < self.vida else (20, 20, 30), 0.85)
+        bx, by, bw = 2, 3 + 6 * s, 30 * s
+        tela.retangulo(bx, by, bx + bw, by + 2 * s, (30, 20, 20))
+        cheio = bw * self.oleo / self.COMBUSTIVEL
+        tela.retangulo(bx, by, bx + cheio, by + 2 * s, (255, 150, 40) if self.oleo > 25 else (220, 60, 30))
+        tela.retangulo(bx, by, bx + cheio, by + max(1, s // 2), (255, 220, 140))
+        hud_texto(tela, f"{self.pontos():06d}", tela.W - 2, 2, s, (255, 230, 140), direita=True)
+        hud_texto(tela, f"ANDAR {self.andar.numero}", tela.W - 2, 3 + 6 * s, s, (200, 200, 230), direita=True)
+        if self.t - self.t_msg < 2.5:
+            tela.texto(tela.rows - 1, self.msg, lerp_cor((255, 255, 255), (90, 90, 110), (self.t - self.t_msg) / 2.5))
+        elif self.t < 5:
+            tela.texto(tela.rows - 1, self.dicas, (200, 200, 220))
+
+
+# ======================================================================== jogos: Turbo Asfalto
+CORES_RIVAIS = [(40, 96, 220), (250, 200, 40), (60, 180, 90), (240, 240, 240), (150, 70, 200), (255, 130, 30)]
+
+
+class TurboAsfalto(Jogo):
+    """Corrida em 3 faixas na pista pseudo-3D: troque de faixa e ultrapasse sem bater."""
+
+    nome, titulo, abertura = "turbo", "Turbo Asfalto", "turbo"
+    dicas = "←/→ troca de faixa   p pausa   q sai"
+    Z_CARRO = 1.15     # profundidade (1/p) do nosso carro na tela
+    ESCALA_Z = 2.2     # distância na pista → profundidade
+    LONGE = 40.0       # onde os rivais aparecem
+    INTERVALO = 0.95   # segundos mínimos entre fileiras
+
+    def iniciar(self, semente):
+        super().iniciar(semente)
+        self.pos, self.vel = 0.0, 6.0
+        self.faixa, self.faixa_vis = 0, 0.0
+        self.rivais = []       # [d, faixa, cor, vel, contado]
+        self.proxima = 12.0    # distância (na pista) até a próxima fileira
+        self.ultrapassou = 0
+        self.batida = None
+        self.cam = Camera()
+
+    def pontos(self):
+        return int(self.pos * 2) + 25 * self.ultrapassou
+
+    def atualizar(self, dt, ent):
+        super().atualizar(dt, ent)
+        self.cam.atualizar(dt, self.rng)
+        if self.batida is not None:
+            self.vel = max(0.0, self.vel - dt * 12)
+            self.pos += self.vel * dt
+            return "fim" if self.t - self.batida > 1.6 else None
+        if ent.apertou("esquerda"):
+            self.faixa = max(-1, self.faixa - 1)
+        if ent.apertou("direita"):
+            self.faixa = min(1, self.faixa + 1)
+        self.faixa_vis += max(-dt * 7, min(dt * 7, self.faixa - self.faixa_vis))
+        self.vel = min(14.0, 6.0 + self.t * 0.05)
+        self.pos += self.vel * dt
+        self.proxima -= self.vel * dt
+        if self.proxima <= 0:
+            self._fileira()
+        for r in self.rivais:
+            r[0] -= (self.vel - r[3]) * dt
+            if not r[4] and r[0] < -0.4:
+                r[4] = True
+                self.ultrapassou += 1
+        self.rivais = [r for r in self.rivais if r[0] > -3]
+        for r in self.rivais:
+            if -0.12 < r[0] < 0.18 and abs(r[1] - self.faixa_vis) < 0.55:
+                self.batida = self.t
+                self.cam.tremer(1.5)
+                break
+        return None
+
+    def _fileira(self):
+        """Uma fileira de 1 ou 2 rivais, todos a meia velocidade: as fileiras chegam até nós
+        no mesmo ritmo em que nasceram. Sempre sobra uma faixa livre, e entre fileiras há
+        pelo menos INTERVALO segundos, tempo de atravessar a pista inteira."""
+        r = self.rng
+        n = 2 if r.random() < min(0.6, 0.15 + self.t * 0.01) else 1
+        for faixa in r.sample((-1, 0, 1), n):
+            self.rivais.append([self.LONGE, faixa, r.choice(CORES_RIVAIS), self.vel * 0.5, False])
+        self.proxima = self.vel * max(self.INTERVALO, r.uniform(1.4, 2.4) - self.t * 0.004)
+
+    def _tela(self, d):
+        """Fração de profundidade p (0 no horizonte, 1 embaixo) de um rival a d à frente."""
+        return 1 / (self.Z_CARRO + max(0.0, d) * self.ESCALA_Z) if d > -1 else 1.2
+
+    def desenhar(self, tela):
+        W, H = tela.W, tela.H
+        self.cam.ajustar(tela)
+        hz = int(H * 0.42)
+        curva = math.sin(self.pos * 0.02) * 0.8
+        turbo_pista(tela, self.pos, curva, hz)
+
+        def lugar(p, faixa):
+            meia = W * 0.03 + p * W * 0.5
+            cx = W / 2 + curva * W * 0.7 * (1 - min(p, 1)) ** 2
+            return cx + faixa * meia * 0.64, hz + p * (H - hz)
+
+        cw = int(min(W * 0.24, H * 0.6))
+        for d, faixa, cor, _, _ in sorted(self.rivais, key=lambda r: -r[0]):
+            p = self._tela(d)
+            if p < 0.04:
+                continue
+            x, y = lugar(p, faixa)
+            w = max(6, cw * p / (1 / self.Z_CARRO))
+            if y - w * 0.5 < H:
+                tela.sombra(x, y, w * 0.5, max(1, w * 0.06), 0.4)
+                tela.desenhar(carro(int(w), cor), x - w / 2, y - w * 0.5)
+        p0 = 1 / self.Z_CARRO
+        x, y = lugar(p0, self.faixa_vis)
+        x += self.cam.dx * cw * 0.2
+        y = min(y, H - cw * 0.5 - 1) + (int(self.t * 12) % 2 if self.batida is None else 0)
+        tela.sombra(x, H - 1, cw * 0.5, max(1, cw * 0.06), 0.4)
+        inclina = (self.faixa - self.faixa_vis) * 0.3
+        tela.desenhar(carro(cw, (220, 36, 48)), x - cw / 2 + inclina * cw, y)
+        for fx in (0.17, 0.83):
+            tela.brilho(x - cw / 2 + cw * fx, y + cw * 0.28, cw * 0.12, (255, 60, 60), 0.5)
+        if self.batida is not None:
+            q = (self.t - self.batida) / 1.0
+            explosao(tela, x, y + cw * 0.25, min(0.99, q), cw * 0.6)
+            if q < 0.3:
+                tela.flash(0.8 * (1 - q / 0.3))
+        s = 1 if H < 90 else 2
+        hud_texto(tela, f"{self.pontos():06d}", 2, 2, s, (255, 230, 140))
+        hud_texto(tela, f"{int(self.vel * 22)}KM/H", tela.W - 2, 2, s, (180, 220, 255), direita=True)
+        if self.t < 4:
+            tela.texto(tela.rows - 1, self.dicas, (255, 255, 255))
+
+
+# ======================================================================== jogos: Astro Vértice
+@functools.lru_cache(maxsize=32)
+def girar(fabrica, h, *args):
+    """Sprite girado 90° no sentido anti-horário: o que apontava para a direita aponta para cima."""
+    spr = fabrica(h, *args)
+    s = Spr(spr.h, spr.w)
+    s.px = {(y, spr.w - 1 - x): c for (x, y), c in spr.px.items()}
+    return s
+
+
+@functools.lru_cache(maxsize=16)
+def rocha(h):
+    h = max(4, int(h))
+    s = Spr(h, h)
+    rampa = [(40, 34, 34), (72, 64, 60), (110, 100, 92), (150, 138, 124)]
+    pts = []
+    for k in range(9):
+        a = k / 9 * 2 * math.pi
+        r = h * 0.45 * (0.78 + 0.22 * _hash(k, h))
+        pts.append((h / 2 + math.cos(a) * r, h / 2 + math.sin(a) * r))
+    s.poligono(pts, rampa)
+    s.contorno((20, 16, 16))
+    for k in range(3):
+        s.px[(int(h * (0.3 + 0.2 * k)), int(h * (0.4 + 0.15 * (k % 2))))] = (50, 44, 42)
+    return s
+
+
+class AstroVertice(Jogo):
+    """Shmup vertical em 5 colunas: a nave pula de coluna em coluna e atira para cima."""
+
+    nome, titulo, abertura = "astro", "Astro Vértice", "astro"
+    dicas = "←/→ muda de coluna   espaço atira   p pausa   q sai"
+    COLUNAS = 5
+    Y_NAVE = 0.86
+    ESCUDO = 3
+
+    def iniciar(self, semente):
+        super().iniciar(semente)
+        self.col, self.col_vis = 2, 2.0
+        self.escudo = self.ESCUDO
+        self.tiros, self.inimigos, self.disparos = [], [], []  # tiros: [col, y]; inimigos: [tipo, col, y, vida]
+        self.explosoes = []  # [col, y, t0, tam]
+        self.recarga, self.proxima, self.abatidos = 0.0, 1.0, 0
+        self.t_dano, self.morreu_em = -9.0, None
+        self.cam = Camera()
+
+    def pontos(self):
+        return 100 * self.abatidos + int(self.t * 5)
+
+    def velocidade(self):
+        return min(0.42, 0.16 + self.t * 0.004)
+
+    def atualizar(self, dt, ent):
+        super().atualizar(dt, ent)
+        self.cam.atualizar(dt, self.rng)
+        self.explosoes = [e for e in self.explosoes if self.t - e[2] < 0.8]
+        if self.morreu_em is not None:
+            return "fim" if self.t - self.morreu_em > 1.8 else None
+        if ent.apertou("esquerda"):
+            self.col = max(0, self.col - 1)
+        if ent.apertou("direita"):
+            self.col = min(self.COLUNAS - 1, self.col + 1)
+        self.col_vis += max(-dt * 12, min(dt * 12, self.col - self.col_vis))
+        self.recarga = max(0.0, self.recarga - dt)
+        if ent.apertou("acao", repetir=True) and self.recarga == 0:
+            self.tiros.append([self.col, self.Y_NAVE - 0.06])
+            self.recarga = 0.2
+        self.proxima -= dt
+        if self.proxima <= 0:
+            self._onda()
+        v = self.velocidade()
+        for t in self.tiros:
+            t[1] -= 1.6 * dt
+        for d in self.disparos:
+            d[1] += (v + 0.35) * dt
+        for e in self.inimigos:
+            e[2] += v * dt * (0.7 if e[0] == "rocha" else 1.0)
+            if e[0] == "drone" and 0.1 < e[2] < 0.6 and self.rng.random() < dt * 0.25 * min(2, 1 + self.t / 60):
+                self.disparos.append([e[1], e[2] + 0.05])
+        for t in list(self.tiros):
+            alvo = max((e for e in self.inimigos if e[1] == t[0] and e[2] < t[1] + 0.04 and e[2] > -0.05),
+                       key=lambda e: e[2], default=None)
+            if alvo and t[1] - alvo[2] < 0.08:
+                self.tiros.remove(t)
+                if alvo[0] == "drone":
+                    self.inimigos.remove(alvo)
+                    self.abatidos += 1
+                    self.explosoes.append([alvo[1], alvo[2], self.t, 1.0])
+                else:
+                    self.explosoes.append([t[0], alvo[2] + 0.04, self.t, 0.3])
+        self.tiros = [t for t in self.tiros if t[1] > -0.1]
+        for e in list(self.inimigos):
+            if e[1] == self.col and abs(e[2] - self.Y_NAVE) < 0.06 and abs(self.col_vis - self.col) < 0.5:
+                self.inimigos.remove(e)
+                self.explosoes.append([e[1], e[2], self.t, 1.0])
+                self._dano()
+        for d in list(self.disparos):
+            if d[0] == self.col and abs(d[1] - self.Y_NAVE) < 0.04 and abs(self.col_vis - self.col) < 0.5:
+                self.disparos.remove(d)
+                self._dano()
+        self.inimigos = [e for e in self.inimigos if e[2] < 1.15]
+        self.disparos = [d for d in self.disparos if d[1] < 1.1]
+        return None
+
+    def _onda(self):
+        """Uma fileira de inimigos em colunas distintas: no máximo 3 por fileira e 2 rochas
+        (indestrutíveis), então sobram sempre duas colunas livres para fugir."""
+        r = self.rng
+        cols = list(range(self.COLUNAS))
+        r.shuffle(cols)
+        n = r.randint(1, min(3, 1 + int(self.t / 25)))
+        for k in range(n):
+            tipo = "rocha" if k < 2 and r.random() < 0.3 else "drone"
+            self.inimigos.append([tipo, cols[k], -0.08, 1])
+        self.proxima = r.uniform(0.7, 1.3) * max(0.55, 1.2 - self.t * 0.006)
+
+    def _dano(self):
+        self.escudo -= 1
+        self.t_dano = self.t
+        self.cam.tremer(1.0)
+        if self.escudo <= 0:
+            self.morreu_em = self.t
+            self.explosoes.append([self.col, self.Y_NAVE, self.t, 2.0])
+
+    def desenhar(self, tela):
+        W, H = tela.W, tela.H
+        self.cam.ajustar(tela)
+        espaco_vertical(tela, self.t, 20)
+        cw = min(W / self.COLUNAS, H * 0.3)
+        X = lambda c: W / 2 + (c - (self.COLUNAS - 1) / 2) * cw
+        dx = self.cam.dx * cw * 0.3
+        for c in range(self.COLUNAS + 1):
+            x = X(c - 0.5)
+            for y in range(0, H, 3):
+                tela.misturar(x, y + (int(self.t * 30) % 3), (80, 120, 200), 0.15)
+        hd = max(5, int(cw * 0.6))
+        for tipo, c, y, _ in self.inimigos:
+            spr = drone(hd) if tipo == "drone" else rocha(int(hd * 1.1))
+            tela.desenhar(spr, X(c) - spr.w / 2 + dx, y * H - spr.h / 2)
+        for c, y in self.disparos:
+            tela.brilho(X(c) + dx, y * H, max(1.5, cw * 0.08), (255, 60, 80), 0.9)
+            tela.retangulo(X(c) - 0.5 + dx, y * H - 2, X(c) + 1 + dx, y * H + 1, (255, 200, 200))
+        for c, y in self.tiros:
+            tela.retangulo(X(c) + dx, y * H - max(2, hd * 0.4), X(c) + 1 + dx, y * H, (255, 250, 150))
+            tela.brilho(X(c) + dx, y * H, max(1.2, cw * 0.06), (255, 230, 80), 0.5)
+        for c, y, t0, tam in self.explosoes:
+            explosao(tela, X(c) + dx, y * H, (self.t - t0) / 0.8, hd * tam)
+        if self.morreu_em is None:
+            hn = max(5, int(cw * 0.5))
+            spr = girar(nave, hn)
+            nx, ny = X(self.col_vis) - spr.w / 2 + dx, self.Y_NAVE * H - spr.h / 2
+            tela.brilho(nx + spr.w / 2, ny + spr.h, hn * (0.5 + 0.1 * math.sin(self.t * 30)), (120, 200, 255), 0.9)
+            pisca = self.t - self.t_dano < 1.0 and int(self.t * 12) % 2 == 0
+            tela.desenhar(spr, nx, ny, (255, 80, 80) if pisca else None)
+        s = 1 if H < 90 else 2
+        hud_texto(tela, f"{self.pontos():06d}", 2, 2, s, (255, 230, 140))
+        for k in range(self.ESCUDO):
+            cor = (120, 220, 255) if k < self.escudo else (40, 50, 70)
+            tela.retangulo(W - 4 - k * 5 * s - 3 * s, 2, W - 4 - k * 5 * s, 2 + 5 * s, cor)
+        if self.t < 4:
+            tela.texto(tela.rows - 1, self.dicas, (255, 255, 255))
+
+
+def espaco_vertical(tela, t, vel):
+    """Como espaco(), mas rolando de cima para baixo."""
+    tela.ceu([(0, (2, 2, 12)), (1, (12, 6, 34))])
+    neb = nebulosa(tela.H, tela.W)  # transposta: W linhas de 2H colunas
+    off = int(t * vel * 0.15)
+    larg = tela.H * 2
+    estilo = tela.estilo
+    for x in range(tela.W):
+        coluna = neb[x]
+        for y in range(tela.H):
+            i = (y - off) % (2 * larg)
+            c, a = coluna[i if i < larg else 2 * larg - 1 - i]  # espelhado: sem emenda ao dar a volta
+            if a > 0.02:
+                px = tela.px[y]
+                px[x] = conv(lerp_cor(px[x], c, a), estilo)
+    for fx, fy, fase, prof in ESTRELAS:
+        y = (fy * tela.H + t * vel * (0.3 + prof)) % tela.H
+        b = 0.5 + 0.5 * math.sin(t * 3 + fase)
+        tela.ponto(fx * tela.W, y, lerp_cor((70, 70, 130), (255, 255, 235), b * (0.4 + 0.6 * prof)))
+
+
+# ======================================================================== jogos: fliperama
+def hud_centro(tela, txt, y, s, cor, contorno=(20, 12, 30)):
+    hud_texto(tela, txt, (tela.W - (len(txt) * 6 - 1) * s) // 2, y, s, cor, contorno)
+
+
+def escala_hud(tela, txt, frac=0.7):
+    return max(1, min(int(tela.W * frac / max(1, len(txt) * 6 - 1)), int(tela.H / 12)))
+
+
+class Fliperama:
+    """Máquina de estados do modo jogo.
+
+    ABERTURA ──start──▶ JOGANDO ──p──▶ PAUSA
+        ▲                  │
+        └── RECORDE ◀── FIM (game over, 2 s de CONTINUE?)
+
+    Sem ninguém apertar, a abertura recomeça (ou passa para o próximo jogo): modo atração."""
+
+    T_CONTINUE = 2.0
+
+    def __init__(self, jogos, estado, recordes=None, semente=None, gravar=None):
+        self.jogos, self.estado = list(jogos), estado
+        self.recordes = recordes or Recordes()
+        self.semente_fixa, self.gravar = semente, gravar
+        self.i, self.modo, self.t = 0, "abertura", 0.0
+        self.jogo, self.pequeno, self.posicao = None, False, None
+        self.tick, self.eventos, self.modo_entrada = 0, [], "kitty"
+
+    @property
+    def chave(self):
+        return self.jogos[self.i]
+
+    def comecar(self):
+        semente = self.semente_fixa if self.semente_fixa is not None else random.randrange(1 << 30)
+        self.jogo = JOGOS[self.chave]()
+        self.jogo.iniciar(semente)
+        self.modo, self.t, self.tick, self.eventos = "jogando", 0.0, 0, []
+
+    def _gravar_tick(self, ent):
+        self.modo_entrada = ent.modo
+        for tipo, teclas in ((1, ent.apert), (2, ent.rep), (3, ent.solt)):
+            for tecla in sorted(teclas):
+                self.eventos.append([self.tick, tecla, tipo])
+
+    def _encerrar(self):
+        pontos = self.jogo.pontos()
+        self.posicao = self.recordes.registrar(self.chave, pontos)
+        self.ultimos_pontos = pontos
+        if self.gravar:
+            dados = {"jogo": self.chave, "semente": self.jogo.semente, "modo": self.modo_entrada,
+                     "ticks": self.tick, "pontos": pontos, "eventos": self.eventos}
+            with open(self.gravar + ".tmp", "w") as f:
+                json.dump(dados, f)
+            os.replace(self.gravar + ".tmp", self.gravar)
+
+    def atualizar(self, dt, ent):
+        if ent.apertou({"q", "ctrl+c"}):
+            return "sair"
+        if ent.apertou("estilo"):
+            self.estado["estilo"] = proximo_estilo(self.estado["estilo"])
+        self.t += dt
+        if self.modo == "abertura":
+            if ent.apertou("start") and self.t > 0.3:
+                self.comecar()
+            elif ent.apertou("esc"):
+                return "sair"
+            elif ent.apertou({"tab", "n", "→"}) or self.t > ABERTURAS[JOGOS[self.chave].abertura][2]:
+                self.i, self.t = (self.i + 1) % len(self.jogos), 0.0
+        elif self.modo == "jogando":
+            if ent.apertou("pausa"):
+                self.modo = "pausa"
+            elif not self.pequeno:
+                self._gravar_tick(ent)
+                r = self.jogo.atualizar(dt, ent)
+                self.tick += 1
+                if r == "fim":
+                    self.modo, self.t = "fim", 0.0
+        elif self.modo == "pausa":
+            if ent.apertou("pausa") or ent.apertou("start"):
+                self.modo = "jogando"
+        elif self.modo == "fim":
+            if self.t > 0.5 and ent.apertou("start"):
+                self._encerrar()
+                self.comecar()
+            elif self.t > self.T_CONTINUE + 0.5:
+                self._encerrar()
+                self.modo, self.t = "recorde", 0.0
+        elif self.modo == "recorde":
+            if (self.t > 1.0 and ent.algo()) or self.t > 6.0:
+                self.modo, self.t = "abertura", 0.0
+        return None
+
+    def desenhar(self, tela=None):
+        tela = tela or Tela(self.estado["estilo"])
+        self.pequeno = tela.cols < TAM_MIN[0] or tela.rows < TAM_MIN[1]
+        if self.modo == "abertura":
+            ABERTURAS[JOGOS[self.chave].abertura][3](tela, self.t)
+            dica = "enter joga   tab outro jogo   q sai" if len(self.jogos) > 1 else "enter joga   q sai"
+            tela.texto(tela.rows - 1, dica, (170, 170, 200))
+        elif self.pequeno and self.modo in ("jogando", "pausa", "fim"):
+            tela_pequena(tela)
+        elif self.modo == "recorde":
+            self._desenhar_recordes(tela)
+        else:
+            self.jogo.desenhar(tela)
+            if self.modo == "pausa":
+                tela.flash(0.55, (0, 0, 0))
+                hud_centro(tela, "PAUSA", tela.H // 2 - 6, escala_hud(tela, "PAUSA", 0.4), (255, 255, 255))
+                tela.texto(tela.rows - 2, "p continua   q sai", (255, 255, 255))
+            elif self.modo == "fim":
+                tela.flash(min(0.6, self.t), (0, 0, 0))
+                s = escala_hud(tela, "GAME OVER", 0.6)
+                hud_centro(tela, "GAME OVER", tela.H // 2 - 6 * s, s, (255, 90, 90))
+                if self.t > 0.5:
+                    n = max(1, math.ceil(self.T_CONTINUE + 0.5 - self.t))
+                    hud_centro(tela, f"CONTINUE? {n}", tela.H // 2 + 2 * s, max(1, s // 2 + 1), (255, 230, 140))
+                    tela.texto(tela.rows - 2, "enter joga de novo", (255, 255, 255))
+        return tela
+
+    def _desenhar_recordes(self, tela):
+        tela.ceu([(0, (14, 8, 40)), (1, (60, 20, 80))])
+        estrelas(tela, self.t, vel=3)
+        s = escala_hud(tela, "RECORDES", 0.5)
+        hud_centro(tela, "RECORDES", 3, s, (255, 220, 120))
+        tab = self.recordes.tabela(self.chave)
+        lin = (6 * s + 5) // 2 + 2
+        tela.texto(lin - 1, JOGOS[self.chave].titulo.upper(), (200, 200, 230))
+        for k, r in enumerate(tab):
+            destaque = k == self.posicao and int(self.t * 4) % 2 == 0
+            cor = (255, 255, 120) if destaque else (255, 255, 255)
+            tela.texto(lin + 1 + k, f"{k + 1}.  {r['pontos']:>8}   {r['data']}", cor)
+        if self.posicao == 0:
+            hud_centro(tela, "NOVO RECORDE!", tela.H - 14, 1, (120, 255, 160))
+        tela.texto(tela.rows - 1, f"sua pontuação: {getattr(self, 'ultimos_pontos', 0)}", (200, 200, 230))
+
+
+def replay(dados):
+    """Toca uma partida gravada, devolvendo o jogo a cada tick (determinístico)."""
+    jogo = JOGOS[dados["jogo"]]()
+    jogo.iniciar(dados["semente"])
+    ent = Entrada()
+    ent.modo = dados.get("modo", "kitty")
+    por_tick = {}
+    for tick, tecla, tipo in dados["eventos"]:
+        por_tick.setdefault(tick, []).append((tecla, tipo))
+    for tick in range(dados["ticks"]):
+        for tecla, tipo in por_tick.get(tick, ()):
+            ent.injetar(tecla, tipo)
+        r = jogo.atualizar(PASSO, ent)
+        ent.fim_do_tick()
+        yield tick, jogo
+        if r == "fim":
+            return
+
+
+# ======================================================================== jogos: registro
+JOGOS = {
+    "gato": PuloDoGato,
+    "tocha": TochaEterna,
+    "turbo": TurboAsfalto,
+    "astro": AstroVertice,
+}
+
+
+# ======================================================================== execução
+def tocar(nome, estado, entrada, saida):
     """Toca uma abertura. Devolve 'fim', 'proxima' ou 'sair'."""
-    t0, duracao = time.time(), ABERTURAS[nome][2]
+    t0, duracao = time.monotonic(), ABERTURAS[nome][2]
     while True:
-        inicio = time.time()
+        inicio = time.monotonic()
         t = inicio - t0
         if t > duracao:
             return "fim"
-        tecla = teclado.ler()
-        if tecla:
-            if tecla[0] in "qQ" or tecla == "\x1b":
-                return "sair"
-            if tecla[0] == " " or tecla in ("\x1b[C", "\n", "\r"):
-                return "proxima"
-            if tecla[0] in "eE":
-                i = ORDEM_ESTILOS.index(estado["estilo"])
-                estado["estilo"] = ORDEM_ESTILOS[(i + 1) % len(ORDEM_ESTILOS)]
-        sys.stdout.write(quadro(nome, estado["estilo"], t).render())
-        sys.stdout.flush()
-        time.sleep(max(0.0, 1 / FPS - (time.time() - inicio)))
+        entrada.ler(inicio)
+        if entrada.apertou({"q", "esc", "ctrl+c"}):
+            return "sair"
+        if entrada.apertou({" ", "→", "enter"}):
+            return "proxima"
+        if entrada.apertou("estilo"):
+            estado["estilo"] = proximo_estilo(estado["estilo"])
+        entrada.fim_do_tick()
+        if estado.pop("redimensionou", False):
+            saida.forcar()
+        saida.mostrar(quadro(nome, estado["estilo"], t))
+        time.sleep(max(0.0, 1 / FPS - (time.monotonic() - inicio)))
+
+
+def proximo_estilo(estilo):
+    return ORDEM_ESTILOS[(ORDEM_ESTILOS.index(estilo) + 1) % len(ORDEM_ESTILOS)]
 
 
 def fila(abertura):
@@ -1276,30 +3537,86 @@ def fila(abertura):
         yield anterior
 
 
-def executar(abertura, estilo, uma_vez):
-    estado = {"estilo": random.choice(ORDEM_ESTILOS) if estilo == "aleatorio" else estilo}
+class Terminal:
+    """Tela alternativa, cursor escondido, teclado e SIGWINCH/SIGTERM; tudo desfeito na saída."""
 
-    def restaurar(*_):
-        sys.stdout.write("\x1b[0m\x1b[?25h\x1b[2J\x1b[?1049l")
-        sys.stdout.flush()
+    def __init__(self, estado, kitty=False):
+        self.estado = estado
+        self.entrada = Entrada(kitty=kitty)
+        self.saida = Saida()
 
-    def ao_encerrar(*_):
-        restaurar()
+    def __enter__(self):
+        signal.signal(signal.SIGTERM, self._sigterm)
+        if hasattr(signal, "SIGWINCH"):
+            signal.signal(signal.SIGWINCH, self._sigwinch)
+        _escrever_stdout("\x1b[?1049h\x1b[?25l\x1b[2J")
+        self.entrada.__enter__()
+        return self
+
+    def __exit__(self, *_):
+        self.entrada.__exit__()
+        _escrever_stdout("\x1b[0m\x1b[?25h\x1b[2J\x1b[?1049l")
+
+    def _sigwinch(self, *_):
+        self.estado["redimensionou"] = True  # o laço principal redesenha; nada de desenhar aqui
+
+    def _sigterm(self, *_):
+        self.__exit__()
         sys.exit(0)
 
-    signal.signal(signal.SIGTERM, ao_encerrar)
-    sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[2J")
+
+def executar(abertura, estilo, uma_vez):
+    estado = {"estilo": random.choice(ORDEM_ESTILOS) if estilo == "aleatorio" else estilo}
     try:
-        with Teclado() as teclado:
+        with Terminal(estado) as term:
             for nome in fila(abertura):
-                if tocar(nome, estado, teclado) == "sair" or uma_vez:
+                if tocar(nome, estado, term.entrada, term.saida) == "sair" or uma_vez:
                     break
                 if estilo == "aleatorio":
                     estado["estilo"] = random.choice(ORDEM_ESTILOS)
     except KeyboardInterrupt:
         pass
-    finally:
-        restaurar()
+
+
+def jogar(jogos, estilo, semente=None, gravar=None):
+    estado = {"estilo": random.choice(ORDEM_ESTILOS) if estilo == "aleatorio" else estilo}
+    fl = Fliperama(jogos, estado, semente=semente, gravar=gravar)
+    try:
+        with Terminal(estado, kitty=True) as term:
+            laco = Laco(term.entrada, term.saida)
+
+            def atualizar(dt, ent):
+                if estado.pop("redimensionou", False):
+                    laco.redimensionou = True
+                return fl.atualizar(dt, ent)
+
+            laco.rodar(atualizar, fl.desenhar)
+    except KeyboardInterrupt:
+        pass
+
+
+def assistir(caminho, estilo):
+    """Toca um replay gravado com --gravar, no ritmo do jogo."""
+    with open(caminho) as f:
+        dados = json.load(f)
+    estado = {"estilo": estilo if estilo in ESTILOS else "gba"}
+    try:
+        with Terminal(estado) as term:
+            for _, jogo in replay(dados):
+                inicio = time.monotonic()
+                term.entrada.ler(inicio)
+                if term.entrada.apertou({"q", "esc", "ctrl+c"}):
+                    break
+                term.entrada.fim_do_tick()
+                if estado.pop("redimensionou", False):
+                    term.saida.forcar()
+                tela = Tela(estado["estilo"])
+                jogo.desenhar(tela)
+                tela.texto(0, "REPLAY", (255, 90, 90), coluna=1)
+                term.saida.mostrar(tela)
+                time.sleep(max(0.0, PASSO - (time.monotonic() - inicio)))
+    except KeyboardInterrupt:
+        pass
 
 
 def listar():
@@ -1307,14 +3624,61 @@ def listar():
     for k, (nome, desc, *_ ) in ABERTURAS.items():
         print(f"  {k:<10} {nome}: {desc}")
     print("  aleatoria  sorteia uma diferente a cada vez (padrão)")
+    print("\nJogos (termboy jogar [nome]):")
+    for k, cls in JOGOS.items():
+        print(f"  {k:<10} {cls.titulo}: {cls.dicas}")
+    print("  (sem nome) todos, trocando com tab na tela de título")
     print("\nEstilos (-e):")
     for k, v in ESTILOS.items():
         print(f"  {k:<10} {v}{'  (padrão)' if k == 'gba' else ''}")
     print("  aleatorio  sorteia a cada abertura")
 
 
+def diagnostico_teclado():
+    """Mostra o modo de entrada detectado e os eventos que chegam. Útil dentro do zellij/tmux."""
+    nomes = {1: "apertou", 2: "repetiu", 3: "soltou"}
+    with Entrada(kitty=True) as ent:
+        print(f"modo: {ent.modo}   (aperte teclas; q sai)")
+        if ent.modo != "kitty":
+            print("sem eventos de soltar tecla: 'soltou' é estimado por tempo")
+        sys.stdout.flush()
+        while True:
+            ent.ler()
+            for tecla, tipo in ent.eventos:
+                print(f"  {tecla!r:<12} {nomes.get(tipo, tipo)}")
+            for tecla in sorted(ent.solt):
+                if ent.modo != "kitty":
+                    print(f"  {tecla!r:<12} soltou (estimado)")
+            sys.stdout.flush()
+            if ent.apertou({"q", "ctrl+c"}):
+                return
+            ent.fim_do_tick()
+            time.sleep(0.01)
+
+
+def main_jogar(argv):
+    import argparse
+
+    p = argparse.ArgumentParser(prog="termboy jogar", description="Modo jogo do termboy.",
+                                epilog="Teclas: enter começa | p pausa | q sai | e troca o estilo | tab troca de jogo")
+    p.add_argument("jogo", nargs="?", choices=list(JOGOS), help="qual jogo (padrão: todos, com tab para trocar)")
+    p.add_argument("-e", "--estilo", default="gba", choices=list(ESTILOS) + ["aleatorio"], help="estilo de cor")
+    p.add_argument("--semente", type=int, help="semente fixa (mesma fase toda partida)")
+    p.add_argument("--gravar", metavar="ARQ", help="grava a última partida como replay em ARQ (json)")
+    p.add_argument("--replay", metavar="ARQ", help="assiste a um replay gravado")
+    args = p.parse_args(argv)
+    if args.replay:
+        assistir(args.replay, args.estilo)
+        return
+    jogar([args.jogo] if args.jogo else list(JOGOS), args.estilo, args.semente, args.gravar)
+
+
 def main():
     import argparse
+
+    if sys.argv[1:2] == ["jogar"]:
+        main_jogar(sys.argv[2:])
+        return
 
     p = argparse.ArgumentParser(
         prog="termboy",
@@ -1327,7 +3691,11 @@ def main():
                    help="estilo de cor (padrão: gba)")
     p.add_argument("-u", "--uma-vez", action="store_true", help="toca uma abertura e sai")
     p.add_argument("-l", "--lista", action="store_true", help="lista aberturas e estilos")
+    p.add_argument("--teclado", action="store_true", help="diagnóstico: mostra o modo de teclado e os eventos")
     args = p.parse_args()
+    if args.teclado:
+        diagnostico_teclado()
+        return
     if args.lista:
         listar()
         return
